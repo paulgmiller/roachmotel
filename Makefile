@@ -1,9 +1,7 @@
-.PHONY: render test policy-test sql-test
-render:
-	python3 -m roachmotel.render
+.PHONY: test build image
 test:
-	python3 -m unittest discover -s tests -v
-policy-test: render
-	PYTHONPATH=. python3 tests/check_kyverno.py
-sql-test:
-	PYTHONPATH=. python3 tests/check_sql.py
+	go test ./...
+build:
+	go build -o build/roachmotel ./cmd/roachmotel
+image:
+	docker build -t roachmotel:dev .

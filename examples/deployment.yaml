@@ -37,3 +37,15 @@ spec:
               memory: 64Mi
             limits:
               memory: 128Mi
+          env:
+            - name: ROACHMOTEL_DATABASE_URL_FILE
+              value: /var/run/roachmotel/connection-string
+          volumeMounts:
+            - name: credentials
+              mountPath: /var/run/roachmotel
+              readOnly: true
+      volumes:
+        - name: credentials
+          secret:
+            secretName: roachmotel-credentials
+            defaultMode: 0440

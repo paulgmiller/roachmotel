@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: roachmotel-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: roachmotel
+  namespace: roachmotel-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: roachmotel
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: roachmotel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: roachmotel
+subjects:
+  - kind: ServiceAccount
+    name: roachmotel
+    namespace: roachmotel-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: roachmotel
+  namespace: roachmotel-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: roachmotel
+  template:
+    metadata:
+      labels:
+        app: roachmotel
+    spec:
+      serviceAccountName: roachmotel
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: roachmotel:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: APPLICATION_URL_TEMPLATE
+              value: 'postgresql://cockroachdb-public.database.svc.cluster.local:26257/?sslmode=verify-full&sslrootcert=/var/run/roachmotel/ca.crt'
+            - name: EXCLUDED_NAMESPACES
+              value: 'local-path-storage,cockroach-operator-system'
+          volumeMounts:
+            - name: admin
+              mountPath: /var/run/admin
+              readOnly: true
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: admin
+          secret:
+            secretName: roachmotel-admin
+            defaultMode: 0440
