@@ -17,13 +17,13 @@ def main():
     args = parser.parse_args()
     config = yaml.safe_load(args.config.read_text())
     deps = yaml.safe_load(Path("dependencies.yaml").read_text())
-    names = ["cert-manager", "approver-policy", "cert-manager-csi-driver", "kyverno",
+    names = ["cert-manager", "approver-policy", "kyverno",
              "cockroach-operator", "db-provision-operator"] if args.stage == "controllers" else ["cockroachdb"]
     if args.stage == "controllers":
         command("kubectl", "apply", "-f", "build/namespaces.yaml")
     for name in names:
         release = deps["releases"][name]
-        namespace = config["certManagerNamespace"] if name in ["cert-manager", "approver-policy", "cert-manager-csi-driver"] else (
+        namespace = config["certManagerNamespace"] if name in ["cert-manager", "approver-policy"] else (
             config["kyvernoNamespace"] if name == "kyverno" else config["infrastructureNamespace"])
         command("helm", "upgrade", "--install", name, release["chart"], "--version", release["version"],
                 "--namespace", namespace, "--values", "build/values/" + name + ".yaml", "--wait", "--timeout", "10m")

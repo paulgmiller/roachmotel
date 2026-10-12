@@ -17,11 +17,8 @@ spec:
       image: busybox:1.37.0
       command: [sh, -c, "sleep 3600"]
       env:
-        - name: PGUSER
-          valueFrom:
-            secretKeyRef:
-              name: old-database
-              key: username
+        - name: ROACHMOTEL_DATABASE_URL
+          value: postgresql://old-database
         - name: APPLICATION_SETTING
           value: preserved
 ---

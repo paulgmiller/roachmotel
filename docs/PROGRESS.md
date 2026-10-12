@@ -1,50 +1,39 @@
-# Initial implementation
+# Implementation progress
 
 ## Implemented
 
-- Local Git repository and committed plan.
-- Deterministic, validated configuration renderer and dependency pins.
-- Official operator Helm values for three CockroachDB nodes, retained PVCs,
-  verified TLS, locality, and distribution across worker nodes.
-- Infrastructure issuer, restricted certificate approvals, and certificate-based
-  database administrator connection.
-- Namespace database generation in a protected namespace, retention, atomic SQL
-  bootstrap, and conflicting database ownership rejection.
-- Namespace-scoped certificate request/use RBAC and strict identity approval.
-- CSI pod injection, non-root filesystem groups, server CA distribution,
-  first-init database wait, PostgreSQL configuration, and repeatable mutation.
-- Policy preventing tenant database CRs from submitting privileged SQL or
-  cross-namespace provisioning requests.
-- Explicit CA bootstrap helper, printed installation commands, and example app.
-- Unit, real Kyverno mutation/validation, CRD schema, and local secure SQL tests.
+- Revised plan, pins, renderer, and official three-node operator values.
+- Retained PVCs, verified node TLS, worker distribution, infrastructure certificates.
+- Protected namespace Database/User CRs and retained source credential Secrets.
+- One generated 48-character password and full connection-string Secret per namespace.
+- Namespace Secret cloning, non-root pod mounts, first-init authentication/grant gate,
+  and an example application reading the mounted connection string.
+- Verified TLS by default; explicit plaintext SQL preserves authentication/node TLS.
+- Removed CSI dependency and application certificate issuance/RBAC policies.
+- Platform-only database CR protection, CA bootstrap helper, printed install commands.
 
 ## Remaining before activation
 
-1. Resolve the pinned DB Provision Operator's failed-initSQL retry defect.
-2. Validate all releases in a disposable Kubernetes cluster, including namespace
-   generation, RBAC aggregation, certificate approval, bootstrap races, renewal,
-   non-root file access, and retained data reattachment.
-3. Test three-node availability during a node outage.
-4. Pin an upstream release with correct bootstrap retry behavior after those tests.
+1. Resolve upstream failed-initSQL retry defect.
+2. Validate Kubernetes generation/Secret races, ownership, retained credentials,
+   reconciliation order, file permissions, both transport modes, certificate renewal.
+3. Verify three-node availability during a node outage.
 
-Rendering and tests do not install into the current Kubernetes context. The local
-secure SQL test uses one temporary process solely for SQL/certificate validation;
-the deployment values always request three managed database nodes.
+Automatic password rotation is disabled for the single-user design.
+No deployment, namespace activation, or blanket pod eviction was performed.
 
-## Verification performed
+## Verification
 
-- Seven unit tests pass.
-- Pinned Kyverno 1.19.1 passes pod mutation/reinvocation and privileged tenant SQL
-  rejection tests, including replacement of an existing Secret-based PGUSER value.
-- Nine custom resources validate against pinned DB Provision, approver-policy,
-  and rendered Kyverno CRDs, rejecting unknown fields.
-- CockroachDB 26.2.3 passes local secure SQL tests for atomic/idempotent bootstrap,
-  CRUD/DDL/new schemas, cross-namespace denial, privileged operation denial,
-  certificate username enforcement, and conflicting database ownership rejection.
-- Official CockroachDB, CockroachDB operator, DB Provision Operator, and Kyverno
-  charts render using the generated values.
+- Eight renderer unit tests cover identity, retention, credentials, transport, and replicas.
+- Real Kyverno mutation/reinvocation checks cover mounts, environment replacement,
+  init ordering, exclusions, escaped Go templates, and privileged tenant SQL rejection.
+- Nine custom resources validate against pinned schemas with unknown fields rejected.
+- Local SQL checks cover password authentication, readiness, password-preserving
+  idempotency, CRUD/DDL/new schemas, namespace isolation, and privilege denial.
+  Both verified TLS and explicitly enabled plaintext SQL pass these checks.
+- The official CockroachDB chart renders three secure nodes in both modes and
+  includes --accept-sql-without-tls only when application TLS is disabled.
 
-The offline Kyverno CLI cannot currently validate the full namespace generation
-policy with its resource discovery context (it reports cluster-scoped generation
-targets as requiring namespaces). CRD/schema validation passes; generation,
-discovery, and authorization remain explicit Kubernetes integration requirements.
+Offline CLI checks cannot establish runtime generation/discovery/RBAC. Kubernetes
+integration remains required. SQL tests use temporary single-node processes;
+deployment values always request three managed nodes.

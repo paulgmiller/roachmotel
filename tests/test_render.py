@@ -26,8 +26,8 @@ class RenderTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 identity(bad)
 
-    def test_configuration_rejects_unsafe_durations_and_shared_infrastructure(self):
-        for key, value in [("certificateDuration", "25h"), ("renewBefore", "24h"),
+    def test_configuration_rejects_unsafe_values_and_shared_infrastructure(self):
+        for key, value in [("workloadTLS", "false"),
                            ("defaultFsGroup", 0), ("clusterDomain", "x'; DROP DATABASE x;")]:
             config = copy.deepcopy(self.config)
             config[key] = value
@@ -49,27 +49,48 @@ class RenderTests(unittest.TestCase):
         sql = db["data"]["spec"]["initSQL"]["inline"][0]
         self.assertTrue(sql.startswith("BEGIN;"))
         self.assertTrue(sql.endswith("COMMIT;"))
-        self.assertIn("PASSWORD NULL", sql)
+        self.assertNotIn("PASSWORD", sql, "bootstrap must not reset managed passwords")
         self.assertNotIn("GRANT admin", sql)
 
-    def test_approval_is_bound_to_exact_namespace_identity(self):
+    def test_one_retained_password_user_and_connection_string_per_namespace(self):
         rules = self.artifacts["namespace-policy.yaml"][0]["spec"]["rules"]
-        policy = rules[1]["generate"]["data"]["spec"]
-        self.assertFalse(policy["allowed"]["isCA"])
-        self.assertEqual(policy["allowed"]["commonName"]["value"], "{{ sql_name }}")
-        self.assertNotIn("dnsNames", policy["allowed"])
-        self.assertNotIn("server auth", policy["allowed"]["usages"])
-        self.assertEqual(policy["selector"]["namespace"]["matchNames"], ["{{ ns_name }}"])
-        binding = rules[3]["generate"]["data"]
-        self.assertEqual(binding["subjects"][0]["name"], "system:serviceaccounts:{{ ns_name }}")
-        role = rules[2]["generate"]["data"]
-        self.assertEqual(role["rules"][0]["resourceNames"], ["roachmotel-{{ sql_name }}"])
+        user = rules[1]["generate"]["data"]
+        self.assertEqual(user["spec"]["username"], "{{ sql_name }}")
+        self.assertEqual(user["metadata"]["namespace"], self.config["infrastructureNamespace"])
+        self.assertEqual(user["metadata"]["annotations"]["dbops.dbprovision.io/deletion-policy"], "Retain")
+        self.assertFalse(user["spec"]["passwordRotation"]["enabled"])
+        password = user["spec"]["passwordSecret"]
+        self.assertFalse(password["includeSpecialChars"])
+        self.assertEqual(password["length"], 48)
+        url = password["secretTemplate"]["data"]["connection-string"]
+        self.assertIn(r"\{{ .Password }}", url)
+        self.assertIn("sslmode=verify-full", url)
+        self.assertNotIn("sslcert", url)
+        self.assertNotIn("sslkey", url)
+        clone = rules[2]["generate"]
+        self.assertEqual(clone["kind"], "Secret")
+        self.assertEqual(clone["name"], "roachmotel-credentials")
+        self.assertEqual(clone["clone"], {"namespace": self.config["infrastructureNamespace"], "name": "{{ ns_name }}-credentials"})
+        self.assertTrue(clone["synchronize"])
 
-    def test_no_private_credentials_are_copied_into_tenant_namespaces(self):
+    def test_no_workload_pki_or_infrastructure_private_keys_are_distributed(self):
         rules = self.artifacts["namespace-policy.yaml"][0]["spec"]["rules"]
-        self.assertNotIn("Secret", [r["generate"]["kind"] for r in rules])
+        self.assertEqual([r["generate"]["kind"] for r in rules], ["Database", "DatabaseUser", "Secret", "ConfigMap"])
+        self.assertNotIn("values/cert-manager-csi-driver.yaml", self.artifacts)
         for rule in rules:
             self.assertEqual(rule["exclude"]["any"][0]["resources"]["names"], excluded(self.config))
+
+    def test_plaintext_is_explicit_and_keeps_cluster_authentication_enabled(self):
+        config = {**self.config, "workloadTLS": False}
+        artifacts = build(config, self.deps)
+        values = artifacts["values/cockroachdb.yaml"][0]["cockroachdb"]
+        self.assertTrue(values["tls"]["enabled"])
+        self.assertEqual(values["crdbCluster"]["startFlags"]["upsert"], ["--accept-sql-without-tls"])
+        rules = artifacts["namespace-policy.yaml"][0]["spec"]["rules"]
+        self.assertNotIn("ConfigMap", [r["generate"]["kind"] for r in rules])
+        url = rules[1]["generate"]["data"]["spec"]["passwordSecret"]["secretTemplate"]["data"]["connection-string"]
+        self.assertIn("sslmode=disable", url)
+        self.assertNotIn("sslrootcert", url)
 
     def test_three_replicas_are_managed_by_the_official_operator(self):
         values = self.artifacts["values/cockroachdb.yaml"][0]["cockroachdb"]

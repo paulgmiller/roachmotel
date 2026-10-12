@@ -15,8 +15,8 @@ import yaml
 ISSUER = {"name": "roachmotel-ca", "kind": "ClusterIssuer", "group": "cert-manager.io"}
 NS = "{{ ns_name }}"
 IDENTITY = "{{ sql_name }}"
-POLICY = "roachmotel-{{ sql_name }}"
-TLS_PATH = "/var/run/cockroachdb"
+CREDENTIAL_PATH = "/var/run/roachmotel"
+CREDENTIAL_SECRET = "roachmotel-credentials"
 TRUST_PATH = "/var/run/cockroachdb-trust"
 LABEL = {"app.kubernetes.io/part-of": "roachmotel"}
 
@@ -61,10 +61,8 @@ def validate_config(config):
         raise ValueError("invalid clusterDomain")
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", config["region"]):
         raise ValueError("invalid region")
-    hours = lambda v: int(v[:-1]) if re.fullmatch(r"[1-9][0-9]*h", v) else 0
-    duration, renewal = hours(config["certificateDuration"]), hours(config["renewBefore"])
-    if not 0 < renewal < duration <= 24:
-        raise ValueError("require 0 < renewBefore < certificateDuration <= 24h")
+    if not isinstance(config["workloadTLS"], bool):
+        raise ValueError("workloadTLS must be a boolean")
     if not isinstance(config["defaultFsGroup"], int) or config["defaultFsGroup"] <= 0:
         raise ValueError("defaultFsGroup must be a positive integer")
 
@@ -84,7 +82,7 @@ def bootstrap_sql(sql_name):
         # Refuse to adopt an unrelated database with conflicting ownership.
         "SELECT 1 / count(*) FROM [SHOW DATABASES] WHERE database_name = current_database() AND owner = current_user;",
         f'CREATE USER IF NOT EXISTS "{sql_name}";',
-        f'ALTER USER "{sql_name}" WITH PASSWORD NULL;',
+        # DatabaseUser assigns the password independently. Never reset it here.
         f'REVOKE ALL ON DATABASE "{sql_name}" FROM public;',
         "REVOKE ALL ON SCHEMA public FROM public;",
         "ALTER DEFAULT PRIVILEGES FOR ALL ROLES REVOKE ALL ON TABLES FROM public;",
@@ -129,42 +127,48 @@ def namespace_policy(config):
               "deletionPolicy": "Retain", "deletionProtection": True,
               "initSQL": {"inline": [bootstrap_sql(IDENTITY)], "failurePolicy": "Block"}})
     database["metadata"]["annotations"] = {"roachmotel.dev/namespace": NS}
-    policy = approval(POLICY, NS, IDENTITY, config["certificateDuration"],
-                      uris=[f"spiffe://roachmotel.local/ns/{NS}/pod/*"])
-    group = [{"kind": "Group", "name": f"system:serviceaccounts:{NS}", "apiGroup": "rbac.authorization.k8s.io"}]
-    use_role = role(POLICY, [{"apiGroups": ["policy.cert-manager.io"],
-        "resources": ["certificaterequestpolicies"], "resourceNames": [POLICY], "verbs": ["use"]}])
-    request_role = role("roachmotel-certificate-request", [{"apiGroups": ["cert-manager.io"],
-        "resources": ["certificaterequests"], "verbs": ["create"]}], NS)
-    objs = [("database", database, False), ("approval-policy", policy, False),
-            ("approval-use-role", use_role, False),
-            ("approval-use-binding", binding(POLICY, POLICY, group), False),
-            ("request-role", request_role, True),
-            ("request-binding", binding("roachmotel-certificate-request", "roachmotel-certificate-request", group,
-                                       NS, cluster_role=False), True)]
+    user = resource("dbops.dbprovision.io/v1alpha1", "DatabaseUser", NS + "-user", infra,
+        spec={"instanceRef": {"name": "roachmotel"}, "username": IDENTITY,
+              "passwordSecret": {"generate": True, "length": 48, "includeSpecialChars": False,
+                  "secretName": NS + "-credentials", "secretTemplate": {
+                      # Backslash escapes the Go template from Kyverno substitution.
+                      # Generated alphanumeric passwords are safe in URI userinfo.
+                      "data": {"connection-string": connection_string(config, r"\{{ .Password }}")}}},
+              "passwordRotation": {"enabled": False}})
+    user["metadata"]["annotations"] = {"roachmotel.dev/namespace": NS,
+        "dbops.dbprovision.io/deletion-policy": "Retain",
+        "dbops.dbprovision.io/deletion-protection": "true"}
+    objs = [("database", database, False), ("user", user, False)]
     rules = [generate_rule(name, obj, config, sync) for name, obj, sync in objs]
-    clone = generate_rule("server-trust", resource("v1", "ConfigMap", "roachmotel-trust", NS), config, True)
+    clone = generate_rule("credentials", resource("v1", "Secret", CREDENTIAL_SECRET, NS), config, True)
     del clone["generate"]["data"]
-    clone["generate"]["clone"] = {"namespace": infra, "name": "roachmotel-trust"}
+    clone["generate"]["clone"] = {"namespace": infra, "name": NS + "-credentials"}
     rules.append(clone)
+    if config["workloadTLS"]:
+        trust = generate_rule("server-trust", resource("v1", "ConfigMap", "roachmotel-trust", NS), config, True)
+        del trust["generate"]["data"]
+        trust["generate"]["clone"] = {"namespace": infra, "name": "roachmotel-trust"}
+        rules.append(trust)
     return resource("kyverno.io/v1", "ClusterPolicy", "roachmotel-namespaces", spec={"rules": rules})
 
 
-def connection_env(config):
+def connection_string(config, password):
     host = f"cockroachdb-public.{config['infrastructureNamespace']}.svc.{config['clusterDomain']}"
-    url = (f"postgresql://{IDENTITY}@{host}:26257/{IDENTITY}?sslmode=verify-full"
-           f"&sslrootcert={TRUST_PATH}/ca.crt&sslcert={TLS_PATH}/tls.crt&sslkey={TLS_PATH}/tls.key")
-    return [{"name": k, "value": v} for k, v in {
-        "PGHOST": host, "PGPORT": "26257", "PGDATABASE": IDENTITY, "PGUSER": IDENTITY,
-        "PGSSLMODE": "verify-full", "PGSSLROOTCERT": f"{TRUST_PATH}/ca.crt",
-        "PGSSLCERT": f"{TLS_PATH}/tls.crt", "PGSSLKEY": f"{TLS_PATH}/tls.key",
-        "ROACHMOTEL_DATABASE_URL": url,
-    }.items()]
+    tls = f"sslmode=verify-full&sslrootcert={TRUST_PATH}/ca.crt" if config["workloadTLS"] else "sslmode=disable"
+    return f"postgresql://{IDENTITY}:{password}@{host}:26257/{IDENTITY}?{tls}"
 
 
-def mounts():
-    return [{"name": "roachmotel-client", "mountPath": TLS_PATH, "readOnly": True},
-            {"name": "roachmotel-trust", "mountPath": TRUST_PATH, "readOnly": True}]
+def connection_env():
+    return [{"name": "ROACHMOTEL_DATABASE_URL", "valueFrom": {"secretKeyRef": {
+        "name": CREDENTIAL_SECRET, "key": "connection-string"}}},
+        {"name": "ROACHMOTEL_DATABASE_URL_FILE", "value": f"{CREDENTIAL_PATH}/connection-string"}]
+
+
+def mounts(config):
+    result = [{"name": "roachmotel-credentials", "mountPath": CREDENTIAL_PATH, "readOnly": True}]
+    if config["workloadTLS"]:
+        result.append({"name": "roachmotel-trust", "mountPath": TRUST_PATH, "readOnly": True})
+    return result
 
 
 def pod_policy(config, image):
@@ -173,23 +177,16 @@ def pod_policy(config, image):
     def rule(name, mutation):
         return {"name": name, "match": match, "exclude": exclude,
                 "context": namespace_context(pod=True), "mutate": mutation}
-    attrs = {"csi.cert-manager.io/issuer-name": ISSUER["name"],
-             "csi.cert-manager.io/issuer-kind": ISSUER["kind"],
-             "csi.cert-manager.io/common-name": IDENTITY,
-             "csi.cert-manager.io/uri-sans": "spiffe://roachmotel.local/ns/${POD_NAMESPACE}/pod/${POD_NAME}/${POD_UID}",
-             "csi.cert-manager.io/key-usages": "digital signature,key encipherment,client auth",
-             "csi.cert-manager.io/duration": config["certificateDuration"],
-             "csi.cert-manager.io/renew-before": config["renewBefore"],
-             "csi.cert-manager.io/fs-group": "{{ to_string(request.object.spec.securityContext.fsGroup || `" + str(config["defaultFsGroup"]) + "`) }}"}
+    volumes = [{"name": "roachmotel-credentials", "secret": {"secretName": CREDENTIAL_SECRET,
+        "defaultMode": 0o440, "items": [{"key": "connection-string", "path": "connection-string"}]}}]
+    if config["workloadTLS"]:
+        volumes.append({"name": "roachmotel-trust", "configMap": {"name": "roachmotel-trust"}})
     volume_rule = rule("volumes", {"patchStrategicMerge": {
         "metadata": {"annotations": {"roachmotel.dev/database": IDENTITY}},
-        "spec": {"securityContext": {"+(fsGroup)": config["defaultFsGroup"]}, "volumes": [
-            {"name": "roachmotel-client", "csi": {"driver": "csi.cert-manager.io", "readOnly": True, "volumeAttributes": attrs}},
-            {"name": "roachmotel-trust", "configMap": {"name": "roachmotel-trust"}},
-        ]}}})
+        "spec": {"securityContext": {"+(fsGroup)": config["defaultFsGroup"]}, "volumes": volumes}}})
     wait = {"name": "roachmotel-wait", "image": image, "command": ["/bin/sh", "-ec"],
-            "args": ['until /cockroach/cockroach sql --url="$ROACHMOTEL_DATABASE_URL" --execute="SELECT 1"; do sleep 5; done'],
-            "env": connection_env(config), "volumeMounts": mounts(),
+            "args": ['until /cockroach/cockroach sql --url="$(cat "$ROACHMOTEL_DATABASE_URL_FILE")" --execute="SELECT 1 / CASE WHEN has_schema_privilege(\'public\', \'CREATE\') AND has_database_privilege(current_database(), \'CREATE\') THEN 1 ELSE 0 END" >/dev/null 2>&1; do sleep 5; done'],
+            "env": connection_env(), "volumeMounts": mounts(config),
             "securityContext": {"runAsNonRoot": True, "runAsUser": 2000, "allowPrivilegeEscalation": False,
                                 "capabilities": {"drop": ["ALL"]}},
             "resources": {"requests": {"cpu": "10m", "memory": "64Mi"}, "limits": {"memory": "256Mi"}}}
@@ -202,10 +199,11 @@ def pod_policy(config, image):
             "[wait_container, request.object.spec.initContainers[?name != 'roachmotel-wait'] || `[]`][]"}},
     ])
     foreach = []
-    env_patch = [{**item, "valueFrom": None} for item in connection_env(config)]
+    env_patch = [{**item, **({"value": None} if "valueFrom" in item else {"valueFrom": None})}
+                 for item in connection_env()]
     for field in ["containers", "initContainers"]:
         foreach.append({"list": f"request.object.spec.{field}[]", "patchStrategicMerge": {"spec": {field: [
-            {"(name)": "{{ element.name }}", "env": env_patch, "volumeMounts": mounts()}]}}})
+            {"(name)": "{{ element.name }}", "env": env_patch, "volumeMounts": mounts(config)}]}}})
     container_rule = rule("container-configuration", {"foreach": foreach})
     return resource("kyverno.io/v1", "ClusterPolicy", "roachmotel-pods", spec={
         "background": False, "failurePolicy": "Fail", "webhookTimeoutSeconds": 10,
@@ -242,12 +240,8 @@ def infrastructure(config):
     # Extend Kyverno's built-in roles by aggregation. Generate RBAC is intentionally
     # privileged and must remain restricted to the platform's policy administrators.
     docs.append(role("roachmotel-kyverno-background", [
-        {"apiGroups": ["dbops.dbprovision.io"], "resources": ["databases"], "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]},
-        {"apiGroups": ["policy.cert-manager.io"], "resources": ["certificaterequestpolicies"], "verbs": ["get", "list", "watch", "create", "update", "patch", "delete", "use"]},
-        {"apiGroups": ["cert-manager.io"], "resources": ["certificaterequests"], "verbs": ["create"]},
-        {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]},
-        {"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles", "rolebindings", "clusterroles", "clusterrolebindings"],
-         "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]},
+        {"apiGroups": ["dbops.dbprovision.io"], "resources": ["databases", "databaseusers"], "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]},
+        {"apiGroups": [""], "resources": ["configmaps", "secrets"], "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]},
     ]))
     docs[-1]["metadata"]["labels"]["rbac.kyverno.io/aggregate-to-background-controller"] = "true"
     return docs
@@ -277,7 +271,6 @@ def helm_values(config, image):
                          "serviceAccount": {"name": "cert-manager"}},
         "approver-policy": {"crds": {"enabled": True}, "app": {
             "approveSignerNames": ["clusterissuers.cert-manager.io/roachmotel-ca"]}},
-        "cert-manager-csi-driver": {"app": {"driver": {"useTokenRequest": True, "continueOnNotReady": False}}},
         "kyverno": {"admissionController": {"replicas": 3}, "backgroundController": {"replicas": 2}},
         "cockroach-operator": {"numReplicas": 3, "cloudRegion": config["region"], "watchNamespaces": infra},
         "db-provision-operator": {"replicaCount": 2, "leaderElect": True, "instanceId": "roachmotel",
@@ -288,6 +281,7 @@ def helm_values(config, image):
                 "caConfigMap": "roachmotel-trust", "issuer": {**ISSUER, "clientCertDuration": "720h",
                     "clientCertExpiryWindow": "240h", "nodeCertDuration": "720h", "nodeCertExpiryWindow": "240h"}}},
             "crdbCluster": {"image": {"name": image}, "dataStore": {"volumeClaimTemplate": {"spec": pvc}},
+                "startFlags": {} if config["workloadTLS"] else {"upsert": ["--accept-sql-without-tls"]},
                 "regions": [{"code": config["region"], "nodes": 3, "cloudProvider": "", "namespace": infra}],
                 "postInitSQL": {"inline": ["CREATE USER IF NOT EXISTS roachmotel_provisioner;",
                     "GRANT admin TO roachmotel_provisioner;",
@@ -305,7 +299,9 @@ def helm_values(config, image):
 def build(config, dependencies):
     validate_config(config)
     policies = namespace_policy(config)
-    policies["spec"]["rules"][0]["generate"]["data"]["metadata"]["labels"]["dbops.dbprovision.io/operator-instance-id"] = "roachmotel"
+    for rule in policies["spec"]["rules"]:
+        if rule["generate"]["kind"] in ["Database", "DatabaseUser"]:
+            rule["generate"]["data"]["metadata"]["labels"]["dbops.dbprovision.io/operator-instance-id"] = "roachmotel"
     docs = infrastructure(config)
     instance = next(doc for doc in docs if doc["kind"] == "DatabaseInstance")
     instance["metadata"]["labels"]["dbops.dbprovision.io/operator-instance-id"] = "roachmotel"

@@ -6,7 +6,7 @@ import tempfile
 
 import yaml
 
-from roachmotel.render import identity
+from roachmotel.render import identity, pod_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 KYVERNO = os.environ.get("KYVERNO", "kyverno")
@@ -34,22 +34,48 @@ def main():
             assert pod["spec"]["initContainers"][0]["name"] == "roachmotel-wait"
             assert pod["metadata"]["annotations"]["roachmotel.dev/database"] == identity(namespace)
             for container in pod["spec"]["containers"] + pod["spec"]["initContainers"]:
-                env = {e["name"]: e["value"] for e in container["env"]}
-                assert env["PGUSER"] == identity(namespace)
-                assert env["PGSSLMODE"] == "verify-full"
+                env = {e["name"]: e for e in container["env"]}
+                assert env["ROACHMOTEL_DATABASE_URL"]["valueFrom"]["secretKeyRef"] == {
+                    "name": "roachmotel-credentials", "key": "connection-string"}
+                assert not env["ROACHMOTEL_DATABASE_URL"].get("value")
+                assert env["ROACHMOTEL_DATABASE_URL_FILE"]["value"] == "/var/run/roachmotel/connection-string"
                 assert len(container["volumeMounts"]) == 2
-                for item in container["env"]:
-                    if item["name"] == "PGUSER":
-                        assert not item.get("valueFrom"), "must clear the old environment source"
-            csi = pod["spec"]["volumes"][0]["csi"]["volumeAttributes"]
-            assert csi["csi.cert-manager.io/fs-group"] == str(group)
-            assert csi["csi.cert-manager.io/common-name"] == identity(namespace)
+            secret_volume = next(v for v in pod["spec"]["volumes"] if v["name"] == "roachmotel-credentials")
+            assert secret_volume["secret"]["secretName"] == "roachmotel-credentials"
+            assert secret_volume["secret"]["defaultMode"] == 0o440
+            assert not any("csi" in v for v in pod["spec"]["volumes"])
         assert [c["name"] for c in apps["app"]["spec"]["initContainers"]] == ["roachmotel-wait", "migrations"]
         assert next(e["value"] for e in apps["app"]["spec"]["containers"][0]["env"] if e["name"] == "APPLICATION_SETTING") == "preserved"
         if "infrastructure" in apps:
             assert "volumes" not in apps["infrastructure"]["spec"]
         second = apply(ROOT / "build/pod-policy.yaml", out / "pods.yaml", out / "twice.yaml")
         assert docs == second, "pod injection must be idempotent"
+        # Check Go template escaping through the real substitution engine.
+        # Full generate rules still need API discovery in a Kubernetes cluster.
+        namespace_policy = yaml.safe_load((ROOT / "build/namespace-policy.yaml").read_text())
+        rule = namespace_policy["spec"]["rules"][1]
+        template = rule["generate"]["data"]["spec"]["passwordSecret"]["secretTemplate"]["data"]["connection-string"]
+        policy = {"apiVersion": "kyverno.io/v1", "kind": "ClusterPolicy", "metadata": {"name": "check-template"},
+            "spec": {"rules": [{"name": "template", "match": rule["match"], "context": rule["context"],
+                "mutate": {"patchStrategicMerge": {"metadata": {"annotations": {"test.roachmotel.dev/url": template}}}}}]}}
+        (out / "template-policy.yaml").write_text(yaml.safe_dump(policy))
+        rendered = apply(out / "template-policy.yaml", ROOT / "tests/fixtures/namespaces.yaml", out / "namespaces.yaml")
+        for namespace in rendered:
+            url = namespace["metadata"]["annotations"]["test.roachmotel.dev/url"]
+            assert "{{ .Password }}" in url and r"\{{" not in url
+            assert identity(namespace["metadata"]["name"]) in url
+        config = yaml.safe_load((ROOT / "config.yaml").read_text())
+        dependencies = yaml.safe_load((ROOT / "dependencies.yaml").read_text())
+        plaintext = pod_policy({**config, "workloadTLS": False}, dependencies["images"]["cockroachdb"])
+        (out / "plaintext-policy.yaml").write_text(yaml.safe_dump(plaintext))
+        plaintext_pods = apply(out / "plaintext-policy.yaml", ROOT / "tests/fixtures/pods.yaml", out / "plaintext-pods.yaml")
+        for pod in plaintext_pods:
+            if pod["metadata"]["namespace"] == config["infrastructureNamespace"]:
+                continue
+            assert len(pod["spec"]["volumes"]) == 1
+            assert "secret" in pod["spec"]["volumes"][0]
+            for container in pod["spec"]["containers"] + pod["spec"]["initContainers"]:
+                assert len(container["volumeMounts"]) == 1
         print("Kyverno mutation passed: credentials, non-root access, init ordering, exclusions, and reinvocation.")
         protection = subprocess.run([KYVERNO, "apply", str(ROOT / "build/protection-policy.yaml"),
             "--resource", str(ROOT / "tests/fixtures/databases.yaml"), "--set", "request.operation=CREATE"],

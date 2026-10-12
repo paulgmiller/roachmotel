@@ -11,6 +11,7 @@ excludedNamespaces:
   - kube-public
   - kube-node-lease
   - cockroach-operator-system
-certificateDuration: 24h
-renewBefore: 8h
+# false permits plaintext application SQL with password authentication.
+# Database nodes and infrastructure administrator connections still use TLS.
+workloadTLS: true
 defaultFsGroup: 2000

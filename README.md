@@ -1,20 +1,21 @@
 # Roachmotel
 
-One CockroachDB database per Kubernetes application namespace, with individual
-pod client certificates and namespace-scoped SQL permissions.
+One CockroachDB database and SQL username/password per Kubernetes application
+namespace, with a Secret containing its full connection string.
 
 The official CockroachDB Kubernetes operator manages **three persistent replicas**.
-DB Provision Operator manages logical databases, Kyverno generates resources and
-injects pod configuration, and cert-manager CSI plus approver-policy issue client
-certificates. There is no custom Go controller.
+DB Provision Operator creates databases/users and generates credentials; Kyverno
+provisions namespace resources and injects pod configuration. Cert-manager and
+approver-policy manage infrastructure certificates only. No workload certificates
+or CSI driver are required.
 
-**Status: initial implementation; not yet ready for cluster activation.** A
-confirmed DB Provision Operator retry defect blocks the planned automatic recovery
-behavior. See [compatibility status](docs/COMPATIBILITY.md) and the [plan](PLAN.md).
+**Status: initial implementation; not ready for cluster activation.** An upstream
+bootstrap retry defect remains blocking. See [compatibility](docs/COMPATIBILITY.md)
+and the [plan](PLAN.md).
 
 ## Render and inspect
 
-Use Python 3.11+ and install `requirements-test.txt` in a virtual environment.
+Use Python 3.11+:
 
 ```sh
 python3 -m venv .venv
@@ -23,57 +24,61 @@ python3 -m venv .venv
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Edit `config.yaml` for your storage class, region/node labels, namespaces, and
-excluded infrastructure. Rendering only writes `build/`; it never reads kubeconfig
-or applies anything. `dependencies.yaml` records exact chart versions.
+Edit config.yaml for storage, region, excluded namespaces, and transport settings.
+Rendering writes build/ only and never accesses kubeconfig or applies resources.
+Dependencies are pinned in dependencies.yaml.
 
-The database and SQL username are both `rm_` followed by the first 32 SHA-256 hex
-characters of the namespace name. This meets the upstream database CRD's naming
-rules, handles numeric/hyphenated/long namespace names, and stays stable across
-deletion/recreation:
+Database names/usernames are `rm_` plus the first 32 SHA-256 hex characters of the
+namespace name. Print the mapping with `python3 -m roachmotel.render --identity tenant-a`.
+Database/User CRs and source credential Secrets stay in infrastructure. Namespace
+Secrets are clones of their own credentials; namespace deletion/recreation should
+restore retained data and passwords. Kubernetes integration validation is pending.
 
-```sh
-python3 -m roachmotel.render --identity tenant-a
-```
+## Transport choices
 
-The injected `roachmotel.dev/database` pod annotation records the mapping. Database
-CRs live in the infrastructure namespace, with Retain, deletion protection, and
-unsynchronized generation, so deleting an application namespace does not delete
-the resource or its SQL data. A recreated namespace regains access by name.
+Default `workloadTLS: true` generates sslmode=verify-full URLs and mounts the public
+CA at /var/run/cockroachdb-trust/ca.crt. This CA is public trust material, not an
+application certificate or private key; its distribution does not need cert-manager.
 
-## Installation sequence for integration testing
+Set `workloadTLS: false` and rerender to allow plaintext application SQL. This adds
+--accept-sql-without-tls to database node start flags and sslmode=disable to application
+URLs. Application CA mounts are removed, but password authentication, node TLS,
+and verified infrastructure connections remain enabled. External transport
+protection is the deployment operator's responsibility in this mode.
 
-Installation requires a test cluster with at least three schedulable worker nodes,
-a working default/configured StorageClass, Helm 3, kubectl, and platform credentials.
-Align `region` with node region labels when present. Three nodes with at least 2
-available CPUs and 4 GiB memory each are the rendered database baseline.
+Do not use CockroachDB --insecure: it permits clients to log in as root without a
+password and defeats namespace isolation. Cert-manager could be replaced with
+externally supplied infrastructure certificates; that option is not implemented.
+Secure database nodes still need certificates.
 
-1. Render, then print and review controller installation commands:
+## Installation for integration testing
+
+Use a disposable Kubernetes cluster with three schedulable workers, a StorageClass,
+Helm 3, kubectl, and platform credentials. The baseline requests 2 CPUs and 4 GiB
+memory per database node. Align region with worker region labels.
+
+1. Render and print controller installation commands:
 
    ```sh
    python3 scripts/commands.py controllers
    ```
 
-   Run the printed commands explicitly. These install cert-manager with its default
-   auto-approver **disabled**, restricted approver-policy, CSI service-account token
-   requests, Kyverno, and the two database operators. On an existing cluster,
-   disabling auto-approval also requires policies for its unrelated certificates.
-   This project targets a new installation.
+   Run the printed commands explicitly. These install cert-manager with unrestricted
+   auto-approval disabled, restricted approver-policy, Kyverno, and both database
+   operators. This targets a new installation; existing certificate consumers
+   would need their own approval policies. Application accounts get no approval RBAC.
 
-2. Install an administrator-provided PEM CA certificate/key. The authority must
-   be suitable for TLS signing and remain valid longer than the issued certificates.
-   Keep the signing key outside this repository:
+2. Install an administrator-provided PEM CA certificate/key, keeping the key out
+   of this repo and ensuring its lifetime exceeds issued certificate lifetimes:
 
    ```sh
    PYTHONPATH=. python3 scripts/bootstrap_trust.py --ca-cert /secure/ca.crt --ca-key /secure/ca.key
    ```
 
-   The key goes only to a Secret in cert-manager's namespace. Only the public CA
-   goes into the infrastructure ConfigMap. Existing authorities are never replaced
-   by this script; coordinated CA rotation is a separate operation.
+   The key goes only to cert-manager's namespace; the public CA goes into the
+   infrastructure ConfigMap. The helper refuses to replace an existing authority.
 
-3. Apply the platform-only database API protection **before** enabling provisioned
-   workloads, then infrastructure resources, and review/run cluster installation:
+3. Protect provisioning APIs, install infrastructure, and print the cluster command:
 
    ```sh
    kubectl apply -f build/protection-policy.yaml
@@ -81,64 +86,55 @@ available CPUs and 4 GiB memory each are the rendered database baseline.
    python3 scripts/commands.py cluster
    ```
 
-   Infrastructure approval policies permit the cert-manager controller to request
-   only root/node/provisioner certificates in the infrastructure namespace. No
-   application service account is bound to these policies. Cluster post-init SQL
-   creates the privileged provisioning user; its certificate remains in the
-   infrastructure namespace. The `DatabaseInstance` uses verified mTLS.
+   Review/run the printed Helm command. Restricted infrastructure approval permits
+   root/node/provisioner certificates only. The provisioning identity connects
+   using verified mTLS irrespective of workloadTLS.
 
-4. **Namespace activation is pending the compatibility gate.** The candidate
-   policies are `build/namespace-policy.yaml` and `build/pod-policy.yaml`. Do not
-   treat them as a validated deployment until the failed-initSQL retry defect is
-   fixed and the Kubernetes scenarios in `docs/COMPATIBILITY.md` pass. No script
-   automatically activates these policies or deploys into your current context.
+4. **Namespace activation remains gated.** Candidate namespace-policy.yaml and
+   pod-policy.yaml in build/ must wait for the upstream fix and Kubernetes tests.
+   No script automatically activates them in your current context.
 
 ## Workload behavior
 
-Once activated, each pod gets its own CSI certificate/key, mounted read-only at
-`/var/run/cockroachdb`; the public server CA is at `/var/run/cockroachdb-trust/ca.crt`.
-The SQL identity is shared within the namespace. Issuance is restricted to that
-namespace's exact CN and service-account group. No workload password is generated.
+Pods receive /var/run/roachmotel/connection-string as a read-only Secret file,
+ROACHMOTEL_DATABASE_URL from the same Secret, and ROACHMOTEL_DATABASE_URL_FILE
+pointing to that file. All pods in a namespace share the same username/password.
+These variables, injected volume names/mount paths, and roachmotel-wait are reserved.
+DATABASE_URL and other PostgreSQL variables are not overwritten: applications must
+explicitly consume the Roachmotel URL or file.
 
-The policy configures `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGSSLMODE`,
-`PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, and `ROACHMOTEL_DATABASE_URL`. These names,
-the two volume names/mount paths, and `roachmotel-wait` are reserved. Existing values
-for those environment variables are replaced. `DATABASE_URL` is not overwritten;
-apps must explicitly use the Roachmotel URL or the PostgreSQL environment settings.
+The first init container waits for authentication and database/schema CREATE
+privileges before migrations start. Secret permissions are 0440. Existing fsGroup
+is preserved, otherwise group 2000 is supplied. Pods wait for Secrets to be present.
+Apps get read/write and DDL within their own database without cluster administration.
 
-The first init container waits for an authenticated SQL connection before any
-application migration init container starts. Existing filesystem groups are
-preserved; otherwise the policy defaults to group 2000. Pods remain pending while
-certificate/volume provisioning is unavailable.
+Passwords are generated as 48 alphanumeric characters. The pinned operator keeps a
+read-back password in a Secret annotation as well as the URL in Secret data. Treat
+**the entire Secret, including metadata, as confidential**. The template contains
+no infrastructure TLS private material.
 
-Certificates last 24 hours and renew eight hours before expiry. Application drivers
-must reload the certificate files for fresh connections. The example under
-`examples/` opens a new connection per iteration, allowing renewal without restarting
-the pod. Build it with `docker build -t roachmotel-demo:0.1.0 examples` and make the
-image available to your test cluster before applying the example Deployment.
+Automatic rotation is disabled. Mounted file consumers must reread credentials and
+refresh pools; environment consumers need restart. Single-user SQL/Secret changes
+require coordination and may briefly interrupt new connections. No automatic or
+zero-downtime rotation is claimed.
 
-## Additional validation
+The example reads the mounted URL for each new connection. Build with
+`docker build -t roachmotel-demo:0.1.0 examples` and make the image available to the
+cluster before deploying the example.
 
-With the pinned Kyverno CLI and CockroachDB binary installed:
+## Validation
+
+With pinned binaries and CRDs available:
 
 ```sh
 KYVERNO=/path/to/kyverno make policy-test
 COCKROACH=/path/to/cockroach make sql-test
-```
-
-`policy-test` checks the real mutation engine: namespace identity, non-root group
-access settings, init ordering, exclusions, and reinvocation. `sql-test` creates
-and cleans up an isolated **local** secure CockroachDB process with temporary keys;
-it checks idempotent bootstrap, CRUD/DDL, new schemas, cross-namespace denial,
-database/user creation denial, and rejection of a root login using a tenant cert.
-It does not test the Kubernetes operator or three-node availability.
-
-Validate generated custom resources against downloaded pinned upstream CRDs:
-
-```sh
+PYTHONPATH=. COCKROACH=/path/to/cockroach python3 tests/check_sql.py --plaintext
 PYTHONPATH=. python3 tests/check_schemas.py --crd-dir /path/to/pinned/crds
 ```
 
-The validator rejects unknown fields; Kubernetes CEL validations and admission
-authorization still require a real test cluster. Namespace generation and approval
-RBAC require cluster integration tests; the CLI alone cannot establish them.
+Policy tests exercise real mutation/template substitution and API protection.
+Local SQL tests use temporary single-node processes with password authentication,
+verified TLS by default, and optional plaintext tested separately. They do not
+exercise Kubernetes or three-node availability. Schema checks reject unknown
+fields; CEL, RBAC, Secret cloning, and generation require actual cluster tests.
