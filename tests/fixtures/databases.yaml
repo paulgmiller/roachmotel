@@ -1,0 +1,22 @@
+apiVersion: dbops.dbprovision.io/v1alpha1
+kind: Database
+metadata:
+  name: privileged-sql-attempt
+  namespace: tenant-a
+spec:
+  name: exploit
+  instanceRef:
+    name: roachmotel
+    namespace: roachmotel-system
+  initSQL:
+    inline: ["GRANT admin TO malicious_user"]
+---
+apiVersion: dbops.dbprovision.io/v1alpha1
+kind: Database
+metadata:
+  name: platform-database
+  namespace: roachmotel-system
+spec:
+  name: platform
+  instanceRef:
+    name: roachmotel

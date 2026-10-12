@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app
+  namespace: tenant-a
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    fsGroup: 10001
+  initContainers:
+    - name: migrations
+      image: busybox:1.37.0
+      command: [sh, -c, "true"]
+  containers:
+    - name: app
+      image: busybox:1.37.0
+      command: [sh, -c, "sleep 3600"]
+      env:
+        - name: PGUSER
+          valueFrom:
+            secretKeyRef:
+              name: old-database
+              key: username
+        - name: APPLICATION_SETTING
+          value: preserved
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: simple
+  namespace: tenant-b
+spec:
+  containers:
+    - name: app
+      image: busybox:1.37.0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: infrastructure
+  namespace: roachmotel-system
+spec:
+  containers:
+    - name: server
+      image: busybox:1.37.0

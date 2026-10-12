@@ -1,0 +1,33 @@
+# Chart and application versions inspected during initial implementation.
+# These pins are candidates for integration validation, not a compatibility claim.
+releases:
+  cert-manager:
+    chart: oci://quay.io/jetstack/charts/cert-manager
+    version: v1.21.2
+    namespace: cert-manager
+  approver-policy:
+    chart: oci://quay.io/jetstack/charts/cert-manager-approver-policy
+    version: v0.28.0
+    namespace: cert-manager
+  cert-manager-csi-driver:
+    chart: oci://quay.io/jetstack/charts/cert-manager-csi-driver
+    version: v0.16.0
+    namespace: cert-manager
+  kyverno:
+    chart: https://kyverno.github.io/kyverno/kyverno-3.9.1.tgz
+    version: 3.9.1
+    namespace: kyverno
+  cockroach-operator:
+    chart: https://charts.cockroachdb.com/v2/cockroachdb-operator-chart-1.1.0.tgz
+    version: 1.1.0
+    namespace: roachmotel-system
+  cockroachdb:
+    chart: https://charts.cockroachdb.com/v2/cockroachdb-chart-26.2.3.tgz
+    version: 26.2.3
+    namespace: roachmotel-system
+  db-provision-operator:
+    chart: https://github.com/panteparak/db-provision-operator/releases/download/v0.14.0/db-provision-operator-0.14.0.tgz
+    version: 0.14.0
+    namespace: roachmotel-system
+images:
+  cockroachdb: cockroachdb/cockroach:v26.2.3

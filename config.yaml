@@ -1,0 +1,16 @@
+# Only platform administrators should modify this configuration.
+infrastructureNamespace: roachmotel-system
+certManagerNamespace: cert-manager
+kyvernoNamespace: kyverno
+clusterDomain: cluster.local
+region: local
+storageClass: "" # Empty selects the cluster's default StorageClass.
+storageSize: 100Gi
+excludedNamespaces:
+  - kube-system
+  - kube-public
+  - kube-node-lease
+  - cockroach-operator-system
+certificateDuration: 24h
+renewBefore: 8h
+defaultFsGroup: 2000
