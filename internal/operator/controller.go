@@ -80,8 +80,10 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 		return nil
 	}
 	id := Identity(ns.Name)
+	// SQL identifiers use underscores; Kubernetes Secret names require DNS names.
+	masterName := strings.ReplaceAll(id, "_", "-")
 	store := c.Client.CoreV1().Secrets(c.Namespace)
-	master, err := store.Get(ctx, id, meta.GetOptions{})
+	master, err := store.Get(ctx, masterName, meta.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		available, checkErr := c.DB.Available(ctx, id)
 		if checkErr != nil {
@@ -94,9 +96,9 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 		if passwordErr != nil {
 			return passwordErr
 		}
-		master, err = store.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: id, Namespace: c.Namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}}, Type: core.SecretTypeOpaque, Data: map[string][]byte{"password": []byte(password)}}, meta.CreateOptions{})
+		master, err = store.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: masterName, Namespace: c.Namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}}, Type: core.SecretTypeOpaque, Data: map[string][]byte{"password": []byte(password)}}, meta.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
-			master, err = store.Get(ctx, id, meta.GetOptions{})
+			master, err = store.Get(ctx, masterName, meta.GetOptions{})
 		}
 	}
 	if err != nil {

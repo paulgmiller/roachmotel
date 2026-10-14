@@ -24,6 +24,25 @@ kubectl -n roachmotel-system create secret generic roachmotel-admin \
 kubectl apply -f deploy/operator.yaml
 ```
 
+For the Zebu cluster, the configuration in `deploy/kustomization.yaml` uses
+`cockroachdb-secure-public.cockroach.svc.cluster.local:26257` with verified TLS
+and a pinned controller image. Install or update it with:
+
+```sh
+python3 deploy/configure-zebu.py
+kubectl --context zebu apply -k deploy
+kubectl --context zebu -n roachmotel-system rollout status deployment/roachmotel
+```
+
+The configuration script copies the password from `cockroach/cockroachdb-root`
+and the public CA from `cockroach/cockroachdb-secure-ca-secret-crt` into
+`roachmotel-system/roachmotel-admin`, without printing credentials. Re-run it
+after changing the source password or CA. The SQL ingress policy permits the
+existing application namespaces and namespaces labeled `roachmotel.dev/enabled=true`;
+add that label to new application namespaces to allow SQL access.
+CockroachDB, its operator, Traefik, WireGuard, and Whoami namespaces are excluded
+from provisioning by this configuration.
+
 Admin URLs can use password authentication or externally supplied client certificates.
 For client certificates, add the required files to the admin Secret and refer to
 `/var/run/admin/FILE` in its URL. No certificates are issued by Roachmotel.
@@ -40,7 +59,9 @@ password authentication and cannot provide namespace isolation.
 
 The controller reconciles namespaces every 30 seconds, including existing ones.
 It skips `kube-*`, its own namespace, `EXCLUDED_NAMESPACES`, terminating namespaces,
-and namespaces labeled `roachmotel.dev/enabled=false`. Exclusion stops reconciliation;
+and namespaces labeled `roachmotel.dev/enabled=false`. Retained credential Secret
+names use `rm-` plus the namespace hash to satisfy Kubernetes naming rules.
+Exclusion stops reconciliation;
 it does not revoke existing access or remove data. Exclude other infrastructure namespaces
 explicitly. Namespace/database identifiers are `rm_` plus 32 SHA-256 hex characters.
 
@@ -80,5 +101,4 @@ COCKROACH=/path/to/cockroach go test ./internal/operator -run TestSQLIntegration
 The optional SQL integration test starts a temporary, password-authenticated local
 CockroachDB with supplied/generated certificates, then checks provisioning, retries,
 DDL, authentication, and tenant isolation. Kubernetes reconciliation uses a fake
-API client in unit tests. This revision has not been deployed into Kubernetes;
-the previous kind cluster was deleted at your request.
+API client in unit tests. The Zebu installation is configured in `deploy/`.

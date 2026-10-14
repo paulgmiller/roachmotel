@@ -7,6 +7,7 @@ import (
 
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -44,9 +45,16 @@ func TestRetryAndNamespaceRecreation(t *testing.T) {
 	if c.Reconcile(ctx, ns) == nil {
 		t.Fatal("expected SQL failure")
 	}
-	master, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, Identity(ns.Name), meta.GetOptions{})
+	masters, err := c.Client.CoreV1().Secrets(c.Namespace).List(ctx, meta.ListOptions{})
 	if err != nil {
 		t.Fatal("password must be persisted before SQL", err)
+	}
+	if len(masters.Items) != 1 {
+		t.Fatal("expected one retained credential before SQL")
+	}
+	master := &masters.Items[0]
+	if errs := validation.IsDNS1123Subdomain(master.Name); len(errs) != 0 {
+		t.Fatalf("Kubernetes would reject retained Secret name %q: %v", master.Name, errs)
 	}
 	if _, err := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{}); err == nil {
 		t.Fatal("published credentials before SQL success")
