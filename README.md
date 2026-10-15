@@ -12,6 +12,10 @@ three database replicas; Roachmotel does not create or resize database nodes.
 Build and publish `docker build -t YOUR_REGISTRY/roachmotel:TAG .`, then set that image
 and `APPLICATION_URL_TEMPLATE` in [deploy/operator.yaml](deploy/operator.yaml).
 The template specifies the application endpoint and TLS settings, without credentials.
+Use a namespace-qualified Kubernetes Service hostname, such as
+`cockroachdb-public.database.svc.cluster.local`. The Service must select the
+CockroachDB pods and expose the template's SQL port (5432 when omitted). Roachmotel
+uses its selector and target port to construct NetworkPolicies.
 
 Create the operator namespace and supply a Secret from a protected local file
 containing the admin PostgreSQL URL:
@@ -25,7 +29,7 @@ kubectl apply -f deploy/operator.yaml
 ```
 
 For the Zebu cluster, the configuration in `deploy/kustomization.yaml` uses
-`cockroachdb-secure-public.cockroach.svc.cluster.local:26257` with verified TLS
+`cockroachdb-secure-public.cockroach.svc.cluster.local:26257` with TLS
 and a pinned controller image. Install or update it with:
 
 ```sh
@@ -37,36 +41,58 @@ kubectl --context zebu -n roachmotel-system rollout status deployment/roachmotel
 The configuration script copies the password from `cockroach/cockroachdb-root`
 and the public CA from `cockroach/cockroachdb-secure-ca-secret-crt` into
 `roachmotel-system/roachmotel-admin`, without printing credentials. Re-run it
-after changing the source password or CA. The SQL ingress policy permits the
-existing application namespaces and namespaces labeled `roachmotel.dev/enabled=true`;
-add that label to new application namespaces to allow SQL access.
+after changing the source password or CA. SQL ingress policies are reconciled
+by Roachmotel for each application namespace; no opt-in label is required.
 CockroachDB, its operator, Traefik, WireGuard, and Whoami namespaces are excluded
 from provisioning by this configuration.
 
 Admin URLs can use password authentication or externally supplied client certificates.
 For client certificates, add the required files to the admin Secret and refer to
 `/var/run/admin/FILE` in its URL. No certificates are issued by Roachmotel.
-For verified application TLS, `ca.crt` must trust the application endpoint; the
-operator copies this public CA into each application Secret. Applications mount
-that Secret at `/var/run/roachmotel` as shown in the example.
-
-Plaintext application SQL is optional: explicitly set `sslmode=disable` in the
-template and configure the existing CockroachDB to accept plaintext SQL with password
-authentication. In that mode `ca.crt` is optional. CockroachDB `--insecure` disables
-password authentication and cannot provide namespace isolation.
+Application URLs use `sslmode=require`: connections use TLS without verifying
+server certificates, so applications need no certificate files. The application
+Secret contains only `connection-string` and is mounted at `/var/run/roachmotel`
+as shown in the example. Admin connections can still use their own CA or client
+certificate files through the admin URL; these are never copied to application Secrets.
+CockroachDB must use password authentication; `--insecure` disables it and cannot
+provide namespace isolation.
 
 ## Behavior
 
 The controller reconciles namespaces every 30 seconds, including existing ones.
 It skips `kube-*`, its own namespace, `EXCLUDED_NAMESPACES`, terminating namespaces,
-and namespaces labeled `roachmotel.dev/enabled=false`. Retained credential Secret
+and the CockroachDB Service namespace. Retained credential Secret
 names use `rm-` plus the namespace hash to satisfy Kubernetes naming rules.
-Exclusion stops reconciliation;
-it does not revoke existing access or remove data. Exclude other infrastructure namespaces
-explicitly. Namespace/database identifiers are `rm_` plus 32 SHA-256 hex characters.
+Infrastructure exclusions stop reconciliation without revoking existing access.
+Exclude other infrastructure namespaces explicitly.
 
-Each namespace receives `roachmotel-credentials`, containing `connection-string`
-and, with verified TLS, `ca.crt`. Pods reference the Secret explicitly; there is no
+Namespaces opt out using the annotation `roachmotel.dev/enabled=false`:
+
+```sh
+kubectl annotate namespace my-app roachmotel.dev/enabled=false
+# Restore access to the same database and credentials:
+kubectl annotate namespace my-app roachmotel.dev/enabled-
+```
+
+On the next reconciliation, opting out disables the SQL user's login, cancels its
+sessions, revokes its database grants, and removes its managed NetworkPolicy and
+application credential Secret. **The database, tables, SQL user, and retained master
+credential are preserved.** Removing the annotation restores access. The legacy
+`roachmotel.dev/enabled=false` label also revokes access; remove it to re-enable.
+
+Each enabled namespace gets an ingress NetworkPolicy in the CockroachDB Service
+namespace allowing all its pods to reach only the SQL target port. A persistent
+infrastructure policy allows traffic from within the database namespace and SQL
+traffic from the operator pods. This remains when all tenants opt out, keeping
+CockroachDB ingress isolated. Use a network plugin that enforces NetworkPolicy.
+Existing egress restrictions must independently allow SQL traffic. Other ingress
+policies are additive: remove old static tenant allowlists, including the tenant
+rules in an already-installed `roachmotel-sql-access` policy, to enforce opt-outs.
+Policies for external monitoring or database administration must be supplied
+separately. Namespace/database identifiers are `rm_` plus 32 SHA-256 hex characters.
+
+Each namespace receives `roachmotel-credentials`, containing only `connection-string`.
+Pods reference the Secret explicitly; there is no
 pod injection, webhook, or automatic restart. [examples/deployment.yaml](examples/deployment.yaml)
 mounts it for the sample application. Kubernetes waits for this required Secret
 before starting the container. The application retries until SQL is available.
@@ -86,7 +112,7 @@ when connecting to a shared existing cluster.
 
 Run exactly **one** operator replica (`Recreate` deployment strategy). There is no
 leader election. The operator holds SQL administration credentials and broad Secret
-RBAC: keep its namespace and service account restricted to platform administrators.
+and NetworkPolicy RBAC: keep its namespace and service account restricted to platform administrators.
 No automatic password rotation or zero-downtime rotation is implemented. Do not edit
 master credentials to rotate passwords; coordinated rotation remains future work.
 

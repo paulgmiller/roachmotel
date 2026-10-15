@@ -27,15 +27,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	var ca []byte
-	if template.Query().Get("sslmode") == "verify-full" {
-		if template.Query().Get("sslrootcert") != "/var/run/roachmotel/ca.crt" {
-			log.Fatal("application sslrootcert must be /var/run/roachmotel/ca.crt")
-		}
-		ca, err = os.ReadFile("/var/run/admin/ca.crt")
-		if err != nil {
-			log.Fatal("cannot read supplied public CA")
-		}
+	if _, _, err := operator.NetworkService(template); err != nil {
+		log.Fatal(err)
 	}
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -54,13 +47,10 @@ func main() {
 	for {
 		// Re-read the mounted admin URL every pass, including after Secret changes.
 		raw, err := os.ReadFile("/var/run/admin/connection-string")
-		if err == nil && template.Query().Get("sslmode") == "verify-full" {
-			ca, err = os.ReadFile("/var/run/admin/ca.crt")
-		}
 		if err == nil {
 			admin, parseErr := pgx.ParseConfig(strings.TrimSpace(string(raw)))
 			if parseErr == nil {
-				controller := operator.Controller{Client: client, DB: &operator.SQLDatabase{Config: admin}, Namespace: namespace, Template: template, CA: ca, Excluded: excluded}
+				controller := operator.Controller{Client: client, DB: &operator.SQLDatabase{Config: admin}, Namespace: namespace, Template: template, Excluded: excluded}
 				pass, cancel := context.WithTimeout(ctx, 30*time.Second)
 				namespaces, listErr := client.CoreV1().Namespaces().List(pass, meta.ListOptions{})
 				cancel()

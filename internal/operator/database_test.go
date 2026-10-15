@@ -92,7 +92,7 @@ func TestSQLIntegration(t *testing.T) {
 		}
 	}
 	connect := func(id, pw string) (*pgx.Conn, error) {
-		u := url.URL{Scheme: "postgresql", Host: fmt.Sprintf("localhost:%d", port), User: url.UserPassword(id, pw), Path: "/" + id, RawQuery: url.Values{"sslmode": {"verify-full"}, "sslrootcert": {filepath.Join(certs, "ca.crt")}}.Encode()}
+		u := url.URL{Scheme: "postgresql", Host: fmt.Sprintf("localhost:%d", port), User: url.UserPassword(id, pw), Path: "/" + id, RawQuery: url.Values{"sslmode": {"require"}}.Encode()}
 		return pgx.Connect(ctx, u.String())
 	}
 	for _, id := range []string{a, b} {
@@ -124,5 +124,53 @@ func TestSQLIntegration(t *testing.T) {
 	if wrong, err := connect(a, "wrong"); err == nil {
 		wrong.Close(ctx)
 		t.Fatal("wrong password accepted")
+	}
+	// Opt-out must reject both retained credentials and an already-open session.
+	if err := db.Revoke(ctx, a); err != nil {
+		t.Fatal("revoke", err)
+	}
+	if err := db.Revoke(ctx, a); err != nil {
+		t.Fatal("idempotent revoke", err)
+	}
+	if blocked, err := connect(a, password); err == nil {
+		blocked.Close(ctx)
+		t.Fatal("opted-out user can still log in")
+	}
+	if _, err := conn.Exec(ctx, "SELECT 1"); err == nil {
+		t.Fatal("opted-out session remained active")
+	}
+	if err := db.Ensure(ctx, a, password, false); err != nil {
+		t.Fatal("re-enable", err)
+	}
+	restored, err := connect(a, password)
+	if err != nil {
+		t.Fatal("restored login", err)
+	}
+	defer restored.Close(ctx)
+	if err := restored.QueryRow(ctx, "SELECT value FROM items WHERE id=1").Scan(&value); err != nil || value != "changed" {
+		t.Fatal("opt-out lost data", err)
+	}
+	if _, err := restored.Exec(ctx, "CREATE TABLE after_opt_out (id INT PRIMARY KEY)"); err != nil {
+		t.Fatal("restored DDL", err)
+	}
+
+}
+
+func TestNetworkService(t *testing.T) {
+	for _, host := range []string{"db.database", "db.database.svc", "db.database.svc.cluster.local", "db.database.svc.cluster.local."} {
+		u, err := url.Parse("postgresql://" + host + ":26257/?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ns, service, err := NetworkService(u)
+		if err != nil || ns != "database" || service != "db" {
+			t.Fatalf("%s: %s %s %v", host, ns, service, err)
+		}
+	}
+	for _, host := range []string{"localhost", "127.0.0.1", "db.example.com"} {
+		u, _ := url.Parse("postgresql://" + host + "/?sslmode=disable")
+		if _, _, err := NetworkService(u); err == nil {
+			t.Fatalf("accepted non-Service host %s", host)
+		}
 	}
 }

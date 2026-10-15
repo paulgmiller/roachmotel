@@ -19,7 +19,13 @@ rules:
     verbs: [get, list]
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, create, update]
+    verbs: [get, create, update, delete]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [networkpolicies]
+    verbs: [get, create, update, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -68,7 +74,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: APPLICATION_URL_TEMPLATE
-              value: 'postgresql://cockroachdb-public.database.svc.cluster.local:26257/?sslmode=verify-full&sslrootcert=/var/run/roachmotel/ca.crt'
+              value: 'postgresql://cockroachdb-public.database.svc.cluster.local:26257/?sslmode=require'
             - name: EXCLUDED_NAMESPACES
               value: 'local-path-storage,cockroach-operator-system'
           volumeMounts:

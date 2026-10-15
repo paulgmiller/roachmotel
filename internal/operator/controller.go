@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"reflect"
 	"strings"
 
 	core "k8s.io/api/core/v1"
@@ -17,11 +18,13 @@ import (
 )
 
 const SecretName = "roachmotel-credentials"
+const EnabledAnnotation = "roachmotel.dev/enabled"
 const namespaceKey = "roachmotel.dev/namespace"
 
 type Database interface {
 	Available(context.Context, string) (bool, error)
 	Ensure(context.Context, string, string, bool) error
+	Revoke(context.Context, string) error
 }
 
 type Controller struct {
@@ -29,7 +32,6 @@ type Controller struct {
 	DB        Database
 	Namespace string
 	Template  *url.URL
-	CA        []byte
 	Excluded  map[string]bool
 }
 
@@ -56,15 +58,15 @@ func ValidateTemplate(raw string) (*url.URL, error) {
 	if err != nil {
 		return nil, errors.New("invalid application URL options")
 	}
-	if q.Get("sslmode") != "verify-full" && q.Get("sslmode") != "disable" {
-		return nil, errors.New("application template requires explicit sslmode=verify-full or sslmode=disable")
+	if q.Get("sslmode") != "require" {
+		return nil, errors.New("application template requires explicit sslmode=require")
 	}
 	for k, values := range q {
 		if len(values) != 1 {
 			return nil, errors.New("duplicate application URL option")
 		}
 		switch k {
-		case "sslmode", "sslrootcert", "connect_timeout":
+		case "sslmode", "connect_timeout":
 		default:
 			return nil, fmt.Errorf("unsupported application URL option %s", k)
 		}
@@ -76,8 +78,21 @@ func ValidateTemplate(raw string) (*url.URL, error) {
 }
 
 func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
-	if ns.DeletionTimestamp != nil || ns.Name == c.Namespace || c.Excluded[ns.Name] || strings.HasPrefix(ns.Name, "kube-") || ns.Labels["roachmotel.dev/enabled"] == "false" {
+	if ns.DeletionTimestamp != nil || ns.Name == c.Namespace || c.Excluded[ns.Name] || strings.HasPrefix(ns.Name, "kube-") {
 		return nil
+	}
+	dbNamespace, _, err := NetworkService(c.Template)
+	if err != nil {
+		return err
+	}
+	if ns.Name == dbNamespace {
+		return nil
+	}
+	if ns.Annotations[EnabledAnnotation] == "false" || ns.Labels[EnabledAnnotation] == "false" {
+		return c.revoke(ctx, ns)
+	}
+	if err := c.ensureNetwork(ctx, ns.Name, true); err != nil {
+		return err
 	}
 	id := Identity(ns.Name)
 	// SQL identifiers use underscores; Kubernetes Secret names require DNS names.
@@ -123,9 +138,6 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	u.Path = "/" + id
 	u.RawPath = ""
 	data := map[string][]byte{"connection-string": []byte(u.String())}
-	if len(c.CA) != 0 {
-		data["ca.crt"] = c.CA
-	}
 	target := c.Client.CoreV1().Secrets(ns.Name)
 	secret, err := target.Get(ctx, SecretName, meta.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -141,7 +153,7 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	if secret.Immutable != nil && *secret.Immutable {
 		return errors.New("namespace credential Secret cannot be immutable")
 	}
-	if string(secret.Data["connection-string"]) == string(data["connection-string"]) && string(secret.Data["ca.crt"]) == string(data["ca.crt"]) {
+	if reflect.DeepEqual(secret.Data, data) {
 		return nil
 	}
 	secret.Data = data
