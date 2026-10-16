@@ -14,15 +14,24 @@ import (
 )
 
 type fakeDB struct {
-	revoked   []string
-	fail      bool
-	available bool
-	passwords []string
-	bootstrap []bool
+	revoked          []string
+	fail             bool
+	available        bool
+	passwords        []string
+	bootstrap        []bool
+	checked          []string
+	ensured          []string
+	existingDatabase bool
+	preserved        []bool
 }
 
-func (d *fakeDB) Available(context.Context, string) (bool, error) { return d.available, nil }
-func (d *fakeDB) Ensure(_ context.Context, _ string, password string, bootstrap bool) error {
+func (d *fakeDB) Available(_ context.Context, id string) (bool, bool, error) {
+	d.checked = append(d.checked, id)
+	return d.available, d.existingDatabase, nil
+}
+func (d *fakeDB) Ensure(_ context.Context, id string, password string, bootstrap, preserveExisting bool) error {
+	d.preserved = append(d.preserved, preserveExisting)
+	d.ensured = append(d.ensured, id)
 	d.passwords = append(d.passwords, password)
 	d.bootstrap = append(d.bootstrap, bootstrap)
 	if d.fail {
@@ -103,7 +112,7 @@ func TestConflictsAndExclusions(t *testing.T) {
 	ctx := context.Background()
 	db.available = false
 	if c.Reconcile(ctx, ns) == nil {
-		t.Fatal("adopted an existing database")
+		t.Fatal("adopted an existing user")
 	}
 	db.available = true
 	_, err := c.Client.CoreV1().Secrets(ns.Name).Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: SecretName}}, meta.CreateOptions{})
@@ -127,6 +136,60 @@ func TestConflictsAndExclusions(t *testing.T) {
 	}
 	if len(db.passwords) != 0 {
 		t.Fatal("provisioned excluded namespace")
+	}
+}
+
+func TestExistingDatabasePreservedAcrossRetries(t *testing.T) {
+	c, db, ns := fixture(t)
+	db.existingDatabase = true
+	db.fail = true
+	ctx := context.Background()
+	if c.Reconcile(ctx, ns) == nil {
+		t.Fatal("expected SQL failure")
+	}
+	db.existingDatabase = false
+	db.fail = false
+	for i := 0; i < 2; i++ {
+		if err := c.Reconcile(ctx, ns); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(db.preserved) != 3 {
+		t.Fatalf("expected three SQL attempts: %v", db.preserved)
+	}
+	for _, preserve := range db.preserved {
+		if !preserve {
+			t.Fatal("retry would change existing database ownership or grants")
+		}
+	}
+}
+
+func TestLegacyCredentialPreservesExistingDatabase(t *testing.T) {
+	c, db, ns := fixture(t)
+	ctx := context.Background()
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	secrets := c.Client.CoreV1().Secrets(c.Namespace)
+	list, err := secrets.List(ctx, meta.ListOptions{})
+	if err != nil || len(list.Items) != 1 {
+		t.Fatal("expected retained credential", err)
+	}
+	master := &list.Items[0]
+	delete(master.Annotations, existingDatabaseKey)
+	if _, err := secrets.Update(ctx, master, meta.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	db.existingDatabase = true
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	if !db.preserved[len(db.preserved)-1] {
+		t.Fatal("upgrade would change existing database ownership or grants")
+	}
+	master, err = secrets.Get(ctx, master.Name, meta.GetOptions{})
+	if err != nil || master.Annotations[existingDatabaseKey] != "true" {
+		t.Fatal("upgrade did not retain existing database state", err)
 	}
 }
 
@@ -165,7 +228,7 @@ func TestNetworkPolicyAndAnnotationOptOut(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(db.revoked) != 2 || db.revoked[0] != Identity(ns.Name) {
+	if len(db.revoked) != 2 || db.revoked[0] != ns.Name || db.revoked[1] != ns.Name {
 		t.Fatal("did not revoke SQL access")
 	}
 	if _, err := policies.Get(ctx, name, meta.GetOptions{}); err == nil {
@@ -295,7 +358,7 @@ func TestNetworkUsesServiceSQLTargetPort(t *testing.T) {
 }
 
 func TestCredentialsContainOnlyTLSRequiredConnectionString(t *testing.T) {
-	c, _, ns := fixture(t)
+	c, db, ns := fixture(t)
 	ctx := context.Background()
 	if err := c.Reconcile(ctx, ns); err != nil {
 		t.Fatal(err)
@@ -332,5 +395,16 @@ func TestCredentialsContainOnlyTLSRequiredConnectionString(t *testing.T) {
 	}
 	if connection.Query().Get("sslmode") != "require" || connection.Query().Get("connect_timeout") != "5" || connection.Query().Has("sslrootcert") {
 		t.Fatalf("unexpected application transport: %v", connection.Query())
+	}
+	if connection.User.Username() != ns.Name || connection.Path != "/"+ns.Name {
+		t.Fatalf("username and database must match namespace %q: %s", ns.Name, connection.Redacted())
+	}
+	if len(db.checked) != 1 || db.checked[0] != ns.Name {
+		t.Fatalf("checked wrong SQL identity: %v", db.checked)
+	}
+	for _, id := range db.ensured {
+		if id != ns.Name {
+			t.Fatalf("provisioned SQL identity %q instead of namespace %q", id, ns.Name)
+		}
 	}
 }

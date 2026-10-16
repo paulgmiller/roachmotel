@@ -11,18 +11,19 @@ type SQLDatabase struct{ Config *pgx.ConnConfig }
 
 func quote(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
 
-func (d *SQLDatabase) Available(ctx context.Context, id string) (bool, error) {
+// Available reports whether the username is available and whether the database exists.
+func (d *SQLDatabase) Available(ctx context.Context, id string) (bool, bool, error) {
 	conn, err := pgx.ConnectConfig(ctx, d.Config.Copy())
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	defer conn.Close(ctx)
-	var exists bool
-	err = conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM [SHOW DATABASES] WHERE database_name=$1) OR EXISTS(SELECT 1 FROM [SHOW USERS] WHERE username=$1)", id).Scan(&exists)
-	return !exists, err
+	var userExists, databaseExists bool
+	err = conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM [SHOW USERS] WHERE username=$1), EXISTS(SELECT 1 FROM [SHOW DATABASES] WHERE database_name=$1)", id).Scan(&userExists, &databaseExists)
+	return !userExists, databaseExists, err
 }
 
-func (d *SQLDatabase) Ensure(ctx context.Context, id, password string, bootstrap bool) error {
+func (d *SQLDatabase) Ensure(ctx context.Context, id, password string, bootstrap, preserveExisting bool) error {
 	conn, err := pgx.ConnectConfig(ctx, d.Config.Copy())
 	if err != nil {
 		return err
@@ -54,6 +55,21 @@ func (d *SQLDatabase) Ensure(ctx context.Context, id, password string, bootstrap
 		return err
 	}
 	defer db.Close(ctx)
+	if preserveExisting {
+		// Add access without changing ownership, PUBLIC grants, or default privileges.
+		for _, statement := range []string{
+			"GRANT CONNECT, CREATE ON DATABASE " + name + " TO " + name,
+			"GRANT USAGE, CREATE ON SCHEMA public TO " + name,
+			"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO " + name,
+			"GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO " + name,
+			"ALTER USER " + name + " WITH LOGIN",
+		} {
+			if _, err := db.Exec(ctx, statement); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	var owner string
 	if err := db.QueryRow(ctx, "SELECT owner FROM [SHOW DATABASES] WHERE database_name=$1", id).Scan(&owner); err != nil {
 		return err

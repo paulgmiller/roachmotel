@@ -32,16 +32,21 @@ For the Zebu cluster, the configuration in `deploy/kustomization.yaml` uses
 `cockroachdb-secure-public.cockroach.svc.cluster.local:26257` with TLS
 and a pinned controller image. Install or update it with:
 
+Supply `roachmotel-system/roachmotel-admin` as above, then run:
+
 ```sh
-python3 deploy/configure-zebu.py
-kubectl --context zebu apply -k deploy
-kubectl --context zebu -n roachmotel-system rollout status deployment/roachmotel
+scripts/deploy.sh
+# Preview manifests or choose an image tag/context:
+scripts/deploy.sh --image paulgmiller/roachmotel:my-tag --render-only
+scripts/deploy.sh --context zebu --image paulgmiller/roachmotel:my-tag
 ```
 
-The configuration script copies the password from `cockroach/cockroachdb-root`
-and the public CA from `cockroach/cockroachdb-secure-ca-secret-crt` into
-`roachmotel-system/roachmotel-admin`, without printing credentials. Re-run it
-after changing the source password or CA. SQL ingress policies are reconciled
+The script runs Go tests, builds and pushes a `linux/amd64` image using Docker
+buildx, deploys the pushed digest, and waits for rollout. It defaults to context
+`zebu` and a timestamp/Git revision tag in `paulgmiller/roachmotel`. Registry login,
+Go, Python 3, Docker buildx, and kubectl are required. Use `--platform` to change
+the image platform and `--timeout` to change the rollout wait (default `180s`).
+The checked-in image pin stays unchanged. SQL ingress policies are reconciled
 by Roachmotel for each application namespace; no opt-in label is required.
 CockroachDB, its operator, Traefik, WireGuard, and Whoami namespaces are excluded
 from provisioning by this configuration.
@@ -89,7 +94,10 @@ Existing egress restrictions must independently allow SQL traffic. Other ingress
 policies are additive: remove old static tenant allowlists, including the tenant
 rules in an already-installed `roachmotel-sql-access` policy, to enforce opt-outs.
 Policies for external monitoring or database administration must be supplied
-separately. Namespace/database identifiers are `rm_` plus 32 SHA-256 hex characters.
+separately. The SQL username and database name exactly match the application
+namespace, including hyphens (for example, `tenant-a`). SQL identifiers are quoted.
+Existing databases and users with hashed names are not automatically renamed or
+migrated; migrate existing tenant data before switching applications to these names.
 
 Each namespace receives `roachmotel-credentials`, containing only `connection-string`.
 Pods reference the Secret explicitly; there is no
@@ -102,13 +110,17 @@ as Secrets in the operator namespace **before** SQL changes. Failed SQL and Secr
 operations retry. Namespace deletion retains its database, SQL user, and master
 credential; recreating the same namespace restores access to the same data/password.
 Back up these master Secrets along with CockroachDB. The operator refuses to adopt
-an existing database/user without its master credential, or overwrite an unrelated
+an existing user without its master credential, or overwrite an unrelated
 application Secret. Retained credentials have no namespace owner references.
 
 Applications can create schemas/tables and read/write their own data. They are not
-admins and cannot drop the database. Public access is revoked on managed databases;
-Roachmotel does not change grants on pre-existing databases. Review those grants
-when connecting to a shared existing cluster.
+admins and cannot drop the database. Public access is revoked on newly created
+databases. If a namespace database already exists, Roachmotel preserves its data,
+ownership, existing grants, and default privileges. It creates the namespace user
+and adds database connect/create, public schema usage/create, public table data
+access, and sequence access. Grants on existing public tables and sequences are
+refreshed on reconciliation. Other schemas and changes to existing objects require
+grants from their owners. Review public grants when reusing an existing database.
 
 Run exactly **one** operator replica (`Recreate` deployment strategy). There is no
 leader election. The operator holds SQL administration credentials and broad Secret

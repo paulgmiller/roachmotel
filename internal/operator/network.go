@@ -110,8 +110,8 @@ func (c *Controller) applyPolicy(ctx context.Context, desired *networking.Networ
 }
 
 func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
-	id := Identity(ns.Name)
-	masterName := strings.ReplaceAll(id, "_", "-")
+	id := ns.Name
+	masterName := strings.ReplaceAll(Identity(ns.Name), "_", "-")
 	master, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, masterName, meta.GetOptions{})
 	var sqlErr error
 	if err == nil {

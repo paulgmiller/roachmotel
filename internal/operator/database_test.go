@@ -73,20 +73,83 @@ func TestSQLIntegration(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	db := SQLDatabase{Config: admin}
-	a, b := Identity("tenant-a"), Identity("tenant-b")
+	t.Run("existing database", func(t *testing.T) {
+		id := "existing-tenant"
+		setup, err := pgx.ConnectConfig(ctx, admin.Copy())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer setup.Close(ctx)
+		for _, statement := range []string{
+			"CREATE USER previous_owner",
+			"CREATE DATABASE " + quote(id) + " WITH OWNER previous_owner",
+			"CREATE TABLE " + quote(id) + ".public.legacy (id INT PRIMARY KEY, value STRING)",
+			"INSERT INTO " + quote(id) + ".public.legacy VALUES (1, 'preserved')",
+			"CREATE SEQUENCE " + quote(id) + ".public.legacy_seq",
+			"GRANT SELECT ON TABLE " + quote(id) + ".public.legacy TO public",
+		} {
+			if _, err := setup.Exec(ctx, statement); err != nil {
+				t.Fatal("setup existing database", err)
+			}
+		}
+		available, exists, err := db.Available(ctx, id)
+		if err != nil || !available || !exists {
+			t.Fatalf("existing database should allow a new user: %v %v %v", available, exists, err)
+		}
+		password, _ := Password()
+		for _, bootstrap := range []bool{true, false} {
+			if err := db.Ensure(ctx, id, password, bootstrap, true); err != nil {
+				t.Fatal("reuse existing database", err)
+			}
+		}
+		var owner string
+		if err := setup.QueryRow(ctx, "SELECT owner FROM [SHOW DATABASES] WHERE database_name=$1", id).Scan(&owner); err != nil || owner != "previous_owner" {
+			t.Fatal("database owner changed", owner, err)
+		}
+		var grants int
+		if err := setup.QueryRow(ctx, "SELECT count(*) FROM [SHOW GRANTS ON TABLE "+quote(id)+".public.legacy] WHERE grantee='public' AND privilege_type='SELECT'").Scan(&grants); err != nil || grants != 1 {
+			t.Fatal("existing grant changed", grants, err)
+		}
+		config := admin.Copy()
+		config.Database = id
+		inspect, err := pgx.ConnectConfig(ctx, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer inspect.Close(ctx)
+		if err := inspect.QueryRow(ctx, "SELECT owner FROM [SHOW SCHEMAS] WHERE schema_name='public'").Scan(&owner); err != nil || owner != "previous_owner" {
+			t.Fatal("schema owner changed", owner, err)
+		}
+		u := url.URL{Scheme: "postgresql", Host: fmt.Sprintf("localhost:%d", port), User: url.UserPassword(id, password), Path: "/" + id, RawQuery: "sslmode=require"}
+		tenant, err := pgx.Connect(ctx, u.String())
+		if err != nil {
+			t.Fatal("new user authentication", err)
+		}
+		defer tenant.Close(ctx)
+		var value string
+		if err := tenant.QueryRow(ctx, "SELECT value FROM legacy WHERE id=1").Scan(&value); err != nil || value != "preserved" {
+			t.Fatal("existing data access", value, err)
+		}
+		for _, statement := range []string{"INSERT INTO legacy VALUES (2, 'new')", "SELECT nextval('legacy_seq')", "CREATE TABLE new_items (id INT)"} {
+			if _, err := tenant.Exec(ctx, statement); err != nil {
+				t.Fatal("new user access", err)
+			}
+		}
+	})
+	a, b := "tenant-a", "tenant-b"
 	password, _ := Password()
 	for _, id := range []string{a, b} {
-		available, err := db.Available(ctx, id)
+		available, _, err := db.Available(ctx, id)
 		if err != nil || !available {
 			t.Fatal("preflight", err)
 		}
-		if err := db.Ensure(ctx, id, password, true); err != nil {
+		if err := db.Ensure(ctx, id, password, true, false); err != nil {
 			t.Fatal("provisioning", err)
 		}
-		if err := db.Ensure(ctx, id, password, false); err != nil {
+		if err := db.Ensure(ctx, id, password, false, false); err != nil {
 			t.Fatal("idempotency", err)
 		}
-		available, err = db.Available(ctx, id)
+		available, _, err = db.Available(ctx, id)
 		if err != nil || available {
 			t.Fatal("collision detection", err)
 		}
@@ -139,7 +202,7 @@ func TestSQLIntegration(t *testing.T) {
 	if _, err := conn.Exec(ctx, "SELECT 1"); err == nil {
 		t.Fatal("opted-out session remained active")
 	}
-	if err := db.Ensure(ctx, a, password, false); err != nil {
+	if err := db.Ensure(ctx, a, password, false, false); err != nil {
 		t.Fatal("re-enable", err)
 	}
 	restored, err := connect(a, password)

@@ -20,10 +20,11 @@ import (
 const SecretName = "roachmotel-credentials"
 const EnabledAnnotation = "roachmotel.dev/enabled"
 const namespaceKey = "roachmotel.dev/namespace"
+const existingDatabaseKey = "roachmotel.dev/existing-database"
 
 type Database interface {
-	Available(context.Context, string) (bool, error)
-	Ensure(context.Context, string, string, bool) error
+	Available(context.Context, string) (bool, bool, error)
+	Ensure(context.Context, string, string, bool, bool) error
 	Revoke(context.Context, string) error
 }
 
@@ -35,6 +36,7 @@ type Controller struct {
 	Excluded  map[string]bool
 }
 
+// Identity provides stable names for retained Kubernetes resources only.
 func Identity(namespace string) string {
 	hash := sha256.Sum256([]byte(namespace))
 	return "rm_" + hex.EncodeToString(hash[:16])
@@ -94,24 +96,23 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	if err := c.ensureNetwork(ctx, ns.Name, true); err != nil {
 		return err
 	}
-	id := Identity(ns.Name)
-	// SQL identifiers use underscores; Kubernetes Secret names require DNS names.
-	masterName := strings.ReplaceAll(id, "_", "-")
+	id := ns.Name
+	masterName := strings.ReplaceAll(Identity(ns.Name), "_", "-")
 	store := c.Client.CoreV1().Secrets(c.Namespace)
 	master, err := store.Get(ctx, masterName, meta.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		available, checkErr := c.DB.Available(ctx, id)
+		available, databaseExists, checkErr := c.DB.Available(ctx, id)
 		if checkErr != nil {
 			return checkErr
 		}
 		if !available {
-			return errors.New("database or username already exists without a retained credential; refusing adoption")
+			return errors.New("username already exists without a retained credential; refusing adoption")
 		}
 		password, passwordErr := Password()
 		if passwordErr != nil {
 			return passwordErr
 		}
-		master, err = store.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: masterName, Namespace: c.Namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}}, Type: core.SecretTypeOpaque, Data: map[string][]byte{"password": []byte(password)}}, meta.CreateOptions{})
+		master, err = store.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: masterName, Namespace: c.Namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name, existingDatabaseKey: fmt.Sprint(databaseExists)}}, Type: core.SecretTypeOpaque, Data: map[string][]byte{"password": []byte(password)}}, meta.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			master, err = store.Get(ctx, masterName, meta.GetOptions{})
 		}
@@ -123,8 +124,20 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	if master.Labels["app.kubernetes.io/managed-by"] != "roachmotel" || master.Annotations[namespaceKey] != ns.Name || len(master.Data["password"]) != 64 || passwordErr != nil {
 		return errors.New("invalid retained credential record")
 	}
+	if _, recorded := master.Annotations[existingDatabaseKey]; !recorded {
+		// Older records did not distinguish existing databases. Preserve them on upgrade.
+		_, exists, checkErr := c.DB.Available(ctx, id)
+		if checkErr != nil {
+			return checkErr
+		}
+		master.Annotations[existingDatabaseKey] = fmt.Sprint(exists)
+		master, err = store.Update(ctx, master, meta.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+	}
 	password := string(master.Data["password"])
-	if err := c.DB.Ensure(ctx, id, password, master.Annotations["roachmotel.dev/provisioned"] != "true"); err != nil {
+	if err := c.DB.Ensure(ctx, id, password, master.Annotations["roachmotel.dev/provisioned"] != "true", master.Annotations[existingDatabaseKey] == "true"); err != nil {
 		return err
 	}
 	if master.Annotations["roachmotel.dev/provisioned"] != "true" {
