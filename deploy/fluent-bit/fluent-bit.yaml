@@ -65,12 +65,7 @@ spec:
         image: cr.fluentbit.io/fluent/fluent-bit:4.2.3
         args:
         - -c
-        - /generated/fluent-bit.conf
-        env:
-        - name: PGSERVICE
-          value: roachmotel
-        - name: PGSERVICEFILE
-          value: /generated/pg_service.conf
+        - /fluent-bit/config/fluent-bit.conf
         ports:
         - name: http
           containerPort: 2020
@@ -102,8 +97,8 @@ spec:
           readOnly: true
         - name: state
           mountPath: /var/lib/fluent-bit
-        - name: generated
-          mountPath: /generated
+        - name: config
+          mountPath: /fluent-bit/config
           readOnly: true
       volumes:
       - name: config
@@ -117,41 +112,3 @@ spec:
         hostPath:
           path: /var/lib/roachmotel-fluent-bit
           type: DirectoryOrCreate
-      - name: credentials
-        secret:
-          secretName: roachmotel-credentials
-          defaultMode: 256
-      - name: generated
-        emptyDir:
-          medium: Memory
-          sizeLimit: 1Mi
-      initContainers:
-      - name: prepare-connection
-        image: python:3.13-alpine
-        command:
-        - python3
-        - /config/prepare.py
-        - /credentials/connection-string
-        - /config/fluent-bit.conf
-        - /generated
-        securityContext:
-          readOnlyRootFilesystem: true
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        resources:
-          requests:
-            cpu: 10m
-            memory: 32Mi
-          limits:
-            memory: 64Mi
-        volumeMounts:
-        - name: config
-          mountPath: /config
-          readOnly: true
-        - name: credentials
-          mountPath: /credentials
-          readOnly: true
-        - name: generated
-          mountPath: /generated
