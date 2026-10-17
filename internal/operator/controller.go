@@ -28,16 +28,25 @@ type Database interface {
 }
 
 type Controller struct {
-	Client    kubernetes.Interface
-	DB        Database
-	Namespace string
-	Template  *url.URL
-	Excluded  map[string]bool
+	Client        kubernetes.Interface
+	DB            Database
+	Namespace     string
+	Template      *url.URL
+	Excluded      map[string]bool
+	LogsNamespace string
 }
 
 func Identity(namespace string) string {
 	hash := sha256.Sum256([]byte(namespace))
 	return "rm_" + hex.EncodeToString(hash[:16])
+}
+
+// identity reserves a literal logs database/user only for the configured collector namespace.
+func (c *Controller) identity(namespace string) string {
+	if c.LogsNamespace != "" && namespace == c.LogsNamespace {
+		return "logs"
+	}
+	return Identity(namespace)
 }
 
 func Password() (string, error) {
@@ -94,7 +103,18 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	if err := c.ensureNetwork(ctx, ns.Name, true); err != nil {
 		return err
 	}
-	id := Identity(ns.Name)
+	id := c.identity(ns.Name)
+	if id == "logs" {
+		// Never silently switch a previously provisioned namespace to another database.
+		legacy := strings.ReplaceAll(Identity(ns.Name), "_", "-")
+		_, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, legacy, meta.GetOptions{})
+		if err == nil {
+			return errors.New("logs namespace already has hashed credentials; explicit migration required")
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
 	// SQL identifiers use underscores; Kubernetes Secret names require DNS names.
 	masterName := strings.ReplaceAll(id, "_", "-")
 	store := c.Client.CoreV1().Secrets(c.Namespace)
@@ -160,3 +180,4 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	_, err = target.Update(ctx, secret, meta.UpdateOptions{})
 	return err
 }
+
