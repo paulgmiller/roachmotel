@@ -35,6 +35,8 @@ and the Fluent Bit collector. Build and publish the updated controller before in
 ```sh
 docker build -t paulgmiller/roachmotel:fluent-bit .
 docker push paulgmiller/roachmotel:fluent-bit
+docker build -f deploy/fluent-bit/Dockerfile -t paulgmiller/roachmotel-log-writer:fluent-bit .
+docker push paulgmiller/roachmotel-log-writer:fluent-bit
 # Supply roachmotel-admin as described above, then:
 kubectl --context zebu apply -k deploy
 kubectl --context zebu -n roachmotel-system rollout status deployment/roachmotel
@@ -51,18 +53,41 @@ controller setting `LOGS_NAMESPACE=logs` reserves SQL database/user `logs` for
 that namespace; other namespaces retain their hashed identities. The controller
 creates its usual `logs/roachmotel-credentials` Secret with a `connection-string`
 key (this is the generated credential referred to as roachkey). No separate
-password or admin credential is supplied to Fluent Bit. The collector waits for
-this required Secret before starting, and uses the controller's namespace SQL
-NetworkPolicy. Deploy the updated controller image before the collector.
-
-The init container reads the generated URI and creates a private libpq service
-file in a memory-backed volume, preserving TLS and connection settings. The
-password is excluded from the Fluent Bit config, environment, and arguments.
-Restart the DaemonSet after manually changing credentials or connection settings.
+password or admin credential is supplied. Only the log writer mounts this required
+Secret; SQL access uses the controller's namespace NetworkPolicy. Deploy the
+updated controller image before creating the collector namespace.
 
 The DaemonSet tails `/var/log/containers/*.log` on every Linux node, including
 tainted nodes and all namespaces, parses Docker/CRI records and adds Kubernetes
-metadata. It stores records in `logs.public.containers` (`tag`, `time`, `data JSONB`).
+metadata. Its HTTP output sends each batch to the `log-writer` Service. The writer
+uses the mounted connection-string Secret directly, including TLS settings, and
+re-reads it for each batch. Credentials never enter Fluent Bit configuration.
+An ingress NetworkPolicy restricts the writer to collector pods in `logs`.
+
+Each source namespace has its own table: `logs.public.default`,
+`logs.public."kube-system"`, etc. Tables are created on the first batch with
+`tag TEXT`, `time TIMESTAMPTZ`, and `data JSONB`. The namespace comes from the
+container log filename in Fluent Bit's source tag, so routing still works when
+Kubernetes metadata lookup fails. Namespace names are validated and quoted
+exactly, preventing collisions or SQL injection. A complete batch commits before
+HTTP success; failures return 503 so Fluent Bit can retry. The writer never changes
+an existing table's retention settings or drops tables when namespaces disappear.
+
+Configure independent retention once a table exists, using an admin connection:
+
+```sql
+-- Seven days for application logs, measured from ingestion:
+ALTER TABLE logs.public."my-app" SET (ttl_expire_after = '7 days');
+-- Thirty days for cluster infrastructure logs:
+ALTER TABLE logs.public."kube-system" SET (ttl_expire_after = '30 days');
+```
+
+`ttl_expire_after` adds CockroachDB's expiration column and uses ingestion time;
+`time` continues to store the original log timestamp. TTL deletion runs in the
+background. No default retention is imposed. See [row-level TTL documentation](https://www.cockroachlabs.com/docs/stable/row-level-ttl).
+If an earlier installation wrote `logs.public.containers`, its rows remain there;
+new batches go to namespace tables. Historical rows are not migrated or deleted.
+
 Offsets and pending chunks persist on each node under
 `/var/lib/roachmotel-fluent-bit`. Retries are unlimited, with a 1 GiB queue per node;
 when full, oldest queued chunks are dropped. Lines larger than 1 MiB are skipped.
@@ -72,8 +97,9 @@ collected. Delivery can duplicate records after retries. Database retention is
 not configured; manage it separately to limit growth.
 
 For a generic installation, set `LOGS_NAMESPACE=logs` on the updated operator,
-then apply `kubectl apply -k deploy/fluent-bit`. The collector derives the SQL
-endpoint from the generated Secret. The node layout assumes container log symlinks
+then apply `kubectl apply -k deploy/fluent-bit`. The writer derives the SQL
+endpoint from the generated Secret. Build and publish its image using the Dockerfile
+shown above. The node layout assumes container log symlinks
 resolve within `/var/log` (as on containerd). Docker installations using
 `/var/lib/docker/containers` need an additional read-only host mount.
 
@@ -160,6 +186,7 @@ master credentials to rotate passwords; coordinated rotation remains future work
 
 ```sh
 go test ./...
+python3 -m unittest discover -s deploy/fluent-bit -p 'test_*.py' -v
 go build ./cmd/roachmotel
 COCKROACH=/path/to/cockroach go test ./internal/operator -run TestSQLIntegration -v
 ```
