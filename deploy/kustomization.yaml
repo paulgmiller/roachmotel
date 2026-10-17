@@ -2,11 +2,11 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - operator.yaml
-  - zebu-sql-access.yaml
+  - fluent-bit
 images:
   - name: roachmotel
     newName: paulgmiller/roachmotel
-    digest: sha256:a49b19673437e75a1988b9fed2c54f56eee868ecdfa0ed4aba5702db8194ea0a
+    newTag: fluent-bit
 patches:
   - target:
       kind: Deployment
@@ -18,3 +18,4 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/env/2/value
         value: cockroach,cockroach-operator-system,traefik,wg,whoami,local-path-storage
+
