@@ -334,3 +334,66 @@ func TestCredentialsContainOnlyTLSRequiredConnectionString(t *testing.T) {
 		t.Fatalf("unexpected application transport: %v", connection.Query())
 	}
 }
+
+func TestLogsNamespaceUsesLiteralDatabaseAndRetainsOptOutBehavior(t *testing.T) {
+	c, db, ns := fixture(t)
+	c.LogsNamespace = "logs"
+	ns.Name = "logs"
+	ctx := context.Background()
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	secret, err := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(string(secret.Data["connection-string"]))
+	if err != nil || u.Path != "/logs" || u.User.Username() != "logs" {
+		t.Fatal("collector did not receive the logs database/user")
+	}
+	if c.identity("other") != Identity("other") {
+		t.Fatal("changed another tenant's identity")
+	}
+	if _, err := c.Client.NetworkingV1().NetworkPolicies("database").Get(ctx, "logs", meta.GetOptions{}); err != nil {
+		t.Fatal("missing collector SQL policy", err)
+	}
+	ns.Annotations = map[string]string{EnabledAnnotation: "false"}
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.revoked) != 1 || db.revoked[0] != "logs" {
+		t.Fatal("did not revoke the logs identity")
+	}
+	if _, err := c.Client.NetworkingV1().NetworkPolicies("database").Get(ctx, "logs", meta.GetOptions{}); err == nil {
+		t.Fatal("retained logs SQL policy after opt-out")
+	}
+	delete(ns.Annotations, EnabledAnnotation)
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
+	if err != nil || string(restored.Data["connection-string"]) != string(secret.Data["connection-string"]) {
+		t.Fatal("collector credentials changed after re-enable")
+	}
+}
+
+func TestLogsNamespaceRefusesImplicitMigrationAndAdoption(t *testing.T) {
+	c, db, ns := fixture(t)
+	ns.Name = "logs"
+	ctx := context.Background()
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	c.LogsNamespace = "logs"
+	before := len(db.passwords)
+	if c.Reconcile(ctx, ns) == nil || len(db.passwords) != before {
+		t.Fatal("silently changed an existing namespace's database")
+	}
+	c, db, ns = fixture(t)
+	c.LogsNamespace = ns.Name
+	db.available = false
+	if c.Reconcile(ctx, ns) == nil || len(db.passwords) != 0 {
+		t.Fatal("adopted a pre-existing logs database or user")
+	}
+}
+
