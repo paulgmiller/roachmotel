@@ -79,7 +79,7 @@ func (c *Controller) ensureNetwork(ctx context.Context, tenant string, allow boo
 	if !allow {
 		return nil
 	}
-	policy := &networking.NetworkPolicy{ObjectMeta: meta.ObjectMeta{Name: strings.ReplaceAll(Identity(tenant), "_", "-"), Namespace: namespace}, Spec: networking.NetworkPolicySpec{
+	policy := &networking.NetworkPolicy{ObjectMeta: meta.ObjectMeta{Name: strings.ReplaceAll(c.identity(tenant), "_", "-"), Namespace: namespace}, Spec: networking.NetworkPolicySpec{
 		PodSelector: meta.LabelSelector{MatchLabels: service.Spec.Selector}, PolicyTypes: []networking.PolicyType{networking.PolicyTypeIngress},
 		Ingress: []networking.NetworkPolicyIngressRule{{From: []networking.NetworkPolicyPeer{peer(tenant)}, Ports: sqlPorts}},
 	}}
@@ -110,7 +110,7 @@ func (c *Controller) applyPolicy(ctx context.Context, desired *networking.Networ
 }
 
 func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
-	id := Identity(ns.Name)
+	id := c.identity(ns.Name)
 	masterName := strings.ReplaceAll(id, "_", "-")
 	master, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, masterName, meta.GetOptions{})
 	var sqlErr error
@@ -153,3 +153,4 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 	}
 	return errors.Join(sqlErr, networkErr, policyErr, secretErr)
 }
+
