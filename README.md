@@ -30,21 +30,61 @@ kubectl apply -f deploy/operator.yaml
 
 For the Zebu cluster, the configuration in `deploy/kustomization.yaml` uses
 `cockroachdb-secure-public.cockroach.svc.cluster.local:26257` with TLS
-and a pinned controller image. Install or update it with:
+and the Fluent Bit collector. Build and publish the updated controller before installing:
 
 ```sh
-python3 deploy/configure-zebu.py
+docker build -t paulgmiller/roachmotel:fluent-bit .
+docker push paulgmiller/roachmotel:fluent-bit
+# Supply roachmotel-admin as described above, then:
 kubectl --context zebu apply -k deploy
 kubectl --context zebu -n roachmotel-system rollout status deployment/roachmotel
 ```
 
-The configuration script copies the password from `cockroach/cockroachdb-root`
-and the public CA from `cockroach/cockroachdb-secure-ca-secret-crt` into
-`roachmotel-system/roachmotel-admin`, without printing credentials. Re-run it
-after changing the source password or CA. SQL ingress policies are reconciled
-by Roachmotel for each application namespace; no opt-in label is required.
-CockroachDB, its operator, Traefik, WireGuard, and Whoami namespaces are excluded
-from provisioning by this configuration.
+The admin Secret must contain a working admin URL and any CA/client files it
+references. SQL ingress policies are reconciled by Roachmotel; no opt-in label is
+required. The Zebu configuration excludes infrastructure namespaces.
+
+## Cluster container logs
+
+`deploy/` includes a Fluent Bit DaemonSet in a dedicated `logs` namespace. The
+controller setting `LOGS_NAMESPACE=logs` reserves SQL database/user `logs` for
+that namespace; other namespaces retain their hashed identities. The controller
+creates its usual `logs/roachmotel-credentials` Secret with a `connection-string`
+key (this is the generated credential referred to as roachkey). No separate
+password or admin credential is supplied to Fluent Bit. The collector waits for
+this required Secret before starting, and uses the controller's namespace SQL
+NetworkPolicy. Deploy the updated controller image before the collector.
+
+The init container reads the generated URI and creates a private libpq service
+file in a memory-backed volume, preserving TLS and connection settings. The
+password is excluded from the Fluent Bit config, environment, and arguments.
+Restart the DaemonSet after manually changing credentials or connection settings.
+
+The DaemonSet tails `/var/log/containers/*.log` on every Linux node, including
+tainted nodes and all namespaces, parses Docker/CRI records and adds Kubernetes
+metadata. It stores records in `logs.public.containers` (`tag`, `time`, `data JSONB`).
+Offsets and pending chunks persist on each node under
+`/var/lib/roachmotel-fluent-bit`. Retries are unlimited, with a 1 GiB queue per node;
+when full, oldest queued chunks are dropped. Lines larger than 1 MiB are skipped.
+Collection starts at the beginning of available files on first install. Logs
+already rotated away, host journal files, and application file-only logs are not
+collected. Delivery can duplicate records after retries. Database retention is
+not configured; manage it separately to limit growth.
+
+For a generic installation, set `LOGS_NAMESPACE=logs` on the updated operator,
+then apply `kubectl apply -k deploy/fluent-bit`. The collector derives the SQL
+endpoint from the generated Secret. The node layout assumes container log symlinks
+resolve within `/var/log` (as on containerd). Docker installations using
+`/var/lib/docker/containers` need an additional read-only host mount.
+
+Use a **new** collector namespace. If `logs` was already provisioned with a hashed
+identity, the controller refuses to switch it silently; choose a fresh namespace
+and update `LOGS_NAMESPACE` and the collector manifests together, or explicitly
+migrate the retained credentials/data. A pre-existing unmanaged SQL `logs` database
+or user also requires explicit migration. The collector namespace must not be
+excluded from reconciliation. Opt-out/re-enable retains the usual credentials
+and SQL/network revocation behavior. Keep the collector namespace restricted to
+administrators: its credential can read logs from every collected namespace.
 
 Admin URLs can use password authentication or externally supplied client certificates.
 For client certificates, add the required files to the admin Secret and refer to
@@ -128,3 +168,4 @@ The optional SQL integration test starts a temporary, password-authenticated loc
 CockroachDB with supplied/generated certificates, then checks provisioning, retries,
 DDL, authentication, and tenant isolation. Kubernetes reconciliation uses a fake
 API client in unit tests. The Zebu installation is configured in `deploy/`.
+
