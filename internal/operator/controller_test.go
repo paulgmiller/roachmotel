@@ -94,7 +94,7 @@ func TestRetryAndNamespaceRecreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	recreated, _ := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
-	if string(first.Data["connection-string"]) != string(recreated.Data["connection-string"]) {
+	if string(first.Data["DATABASE_URL"]) != string(recreated.Data["DATABASE_URL"]) {
 		t.Fatal("credentials changed after namespace recreation")
 	}
 	for _, p := range db.passwords {
@@ -193,6 +193,33 @@ func TestLegacyCredentialPreservesExistingDatabase(t *testing.T) {
 	}
 }
 
+func TestControllerIgnoresOtherCredentialSecret(t *testing.T) {
+	c, _, ns := fixture(t)
+	ctx := context.Background()
+	secrets := c.Client.CoreV1().Secrets(ns.Name)
+	ignored := &core.Secret{ObjectMeta: meta.ObjectMeta{Name: "roachmotel-credentials", Namespace: ns.Name, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}}, Data: map[string][]byte{"connection-string": []byte("leave alone")}}
+	if _, err := secrets.Create(ctx, ignored, meta.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c.Client.(*fake.Clientset).ClearActions()
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	ns.Annotations = map[string]string{EnabledAnnotation: "false"}
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range c.Client.(*fake.Clientset).Actions() {
+		if get, ok := action.(interface{ GetName() string }); ok && get.GetName() == ignored.Name {
+			t.Fatalf("controller accessed ignored Secret: %s", action.GetVerb())
+		}
+	}
+	retained, err := secrets.Get(ctx, ignored.Name, meta.GetOptions{})
+	if err != nil || string(retained.Data["connection-string"]) != "leave alone" {
+		t.Fatal("controller changed ignored Secret", err)
+	}
+}
+
 func TestTemplateCannotLeakAdminCredentials(t *testing.T) {
 	for _, raw := range []string{"postgresql://root:secret@db/?sslmode=require", "postgresql://db/?sslmode=verify-full&sslkey=/admin/key", "postgresql://db/?sslmode=disable", "postgresql://db/?sslmode=verify-full", "postgresql://db/?sslmode=require&sslrootcert=/ca.crt", "postgresql://db/?sslmode=require&user=root"} {
 		if _, err := ValidateTemplate(raw); err == nil {
@@ -248,7 +275,7 @@ func TestNetworkPolicyAndAnnotationOptOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored, _ := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
-	if string(first.Data["connection-string"]) != string(restored.Data["connection-string"]) {
+	if string(first.Data["DATABASE_URL"]) != string(restored.Data["DATABASE_URL"]) {
 		t.Fatal("re-enable changed credentials")
 	}
 	if _, err := policies.Get(ctx, name, meta.GetOptions{}); err != nil {
@@ -360,6 +387,13 @@ func TestNetworkUsesServiceSQLTargetPort(t *testing.T) {
 func TestCredentialsContainOnlyTLSRequiredConnectionString(t *testing.T) {
 	c, db, ns := fixture(t)
 	ctx := context.Background()
+	_, err := c.Client.CoreV1().Secrets(ns.Name).Create(ctx, &core.Secret{
+		ObjectMeta: meta.ObjectMeta{Name: "roachkey", Namespace: ns.Name, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}},
+		Data:       map[string][]byte{"DATABASE_URL": []byte("postgresql://rm_old:old@cockroachdb.database:26257/rm_old?sslmode=require")},
+	}, meta.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Reconcile(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +423,7 @@ func TestCredentialsContainOnlyTLSRequiredConnectionString(t *testing.T) {
 	if len(secret.Data) != 1 {
 		t.Fatalf("unexpected credential keys: %v", secret.Data)
 	}
-	connection, err := url.Parse(string(secret.Data["connection-string"]))
+	connection, err := url.Parse(string(secret.Data["DATABASE_URL"]))
 	if err != nil {
 		t.Fatal(err)
 	}

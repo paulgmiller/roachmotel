@@ -56,7 +56,7 @@ For client certificates, add the required files to the admin Secret and refer to
 `/var/run/admin/FILE` in its URL. No certificates are issued by Roachmotel.
 Application URLs use `sslmode=require`: connections use TLS without verifying
 server certificates, so applications need no certificate files. The application
-Secret contains only `connection-string` and is mounted at `/var/run/roachmotel`
+Secret contains only `DATABASE_URL` and is mounted at `/var/run/roachmotel`
 as shown in the example. Admin connections can still use their own CA or client
 certificate files through the admin URL; these are never copied to application Secrets.
 CockroachDB must use password authentication; `--insecure` disables it and cannot
@@ -99,7 +99,8 @@ namespace, including hyphens (for example, `tenant-a`). SQL identifiers are quot
 Existing databases and users with hashed names are not automatically renamed or
 migrated; migrate existing tenant data before switching applications to these names.
 
-Each namespace receives `roachmotel-credentials`, containing only `connection-string`.
+Each namespace receives `roachkey`, containing only `DATABASE_URL`.
+The controller ignores `roachmotel-credentials` entirely, including during opt-out.
 Pods reference the Secret explicitly; there is no
 pod injection, webhook, or automatic restart. [examples/deployment.yaml](examples/deployment.yaml)
 mounts it for the sample application. Kubernetes waits for this required Secret

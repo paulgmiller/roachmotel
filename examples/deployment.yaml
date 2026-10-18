@@ -39,7 +39,7 @@ spec:
               memory: 128Mi
           env:
             - name: ROACHMOTEL_DATABASE_URL_FILE
-              value: /var/run/roachmotel/connection-string
+              value: /var/run/roachmotel/DATABASE_URL
           volumeMounts:
             - name: credentials
               mountPath: /var/run/roachmotel
@@ -47,5 +47,5 @@ spec:
       volumes:
         - name: credentials
           secret:
-            secretName: roachmotel-credentials
+            secretName: roachkey
             defaultMode: 0440

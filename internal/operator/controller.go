@@ -17,7 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-const SecretName = "roachmotel-credentials"
+const SecretName = "roachkey"
 const EnabledAnnotation = "roachmotel.dev/enabled"
 const namespaceKey = "roachmotel.dev/namespace"
 const existingDatabaseKey = "roachmotel.dev/existing-database"
@@ -150,17 +150,21 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	u.User = url.UserPassword(id, password)
 	u.Path = "/" + id
 	u.RawPath = ""
-	data := map[string][]byte{"connection-string": []byte(u.String())}
-	target := c.Client.CoreV1().Secrets(ns.Name)
+	return c.publishCredential(ctx, ns.Name, u.String())
+}
+
+func (c *Controller) publishCredential(ctx context.Context, namespace, value string) error {
+	data := map[string][]byte{"DATABASE_URL": []byte(value)}
+	target := c.Client.CoreV1().Secrets(namespace)
 	secret, err := target.Get(ctx, SecretName, meta.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		_, err = target.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: SecretName, Namespace: ns.Name, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}}, Type: core.SecretTypeOpaque, Data: data}, meta.CreateOptions{})
+		_, err = target.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: SecretName, Namespace: namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: namespace}}, Type: core.SecretTypeOpaque, Data: data}, meta.CreateOptions{})
 		return err
 	}
 	if err != nil {
 		return err
 	}
-	if secret.Labels["app.kubernetes.io/managed-by"] != "roachmotel" || secret.Annotations[namespaceKey] != ns.Name {
+	if !managed(secret, namespace) {
 		return errors.New("namespace Secret already exists and is not managed by roachmotel")
 	}
 	if secret.Immutable != nil && *secret.Immutable {
