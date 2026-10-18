@@ -97,4 +97,3 @@ spec:
           secret:
             secretName: roachmotel-admin
             defaultMode: 0440
-

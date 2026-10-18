@@ -30,7 +30,7 @@ kubectl apply -f deploy/operator.yaml
 
 For the Zebu cluster, the configuration in `deploy/kustomization.yaml` uses
 `cockroachdb-secure-public.cockroach.svc.cluster.local:26257` with TLS
-and the Fluent Bit collector.
+and a pinned controller image, plus the Fluent Bit collector.
 
 Supply `roachmotel-system/roachmotel-admin` as above, then run:
 
@@ -75,7 +75,6 @@ tainted nodes and all namespaces, parses Docker/CRI records, and adds Kubernetes
 metadata. All records go into **`logs.public.containers`**, which the output plugin
 creates with `tag`, `time`, and `data` (JSONB) columns. Namespace information stays
 in the source tag and Kubernetes metadata; there are no per-namespace tables.
-Existing namespace tables are left in place; historical rows are not moved or deleted.
 No default retention is imposed.
 
 Offsets and pending chunks persist on each node under
@@ -85,22 +84,15 @@ Collection starts at the beginning of available files on first install. Logs
 already rotated away, host journal files, and application file-only logs are not
 collected. Delivery can duplicate records after retries.
 
-For a generic installation, set the `Host` and `Port` in
-`deploy/fluent-bit/fluent-bit.conf` to match the operator's application endpoint,
-then apply `kubectl apply -k deploy/fluent-bit`. The plugin's explicit host/port
-settings override those in the URL; credentials and TLS settings come from the
-Secret. Output logging is restricted to errors because the plugin includes its
+For a generic installation, apply `kubectl apply -k deploy/fluent-bit`. An init
+container derives the plugin's required host/port settings from `DATABASE_URL`;
+credentials and TLS settings come from that same Secret. No endpoint is configured
+separately. Output logging is restricted to errors because the plugin includes its
 Database setting in informational messages. Restart the DaemonSet after updating
 credentials: `kubectl -n logs rollout restart daemonset/fluent-bit`.
 The node layout assumes container log symlinks resolve within `/var/log` (as on
 containerd). Docker installations using `/var/lib/docker/containers` need an
 additional read-only host mount.
-
-When upgrading an installation that used the HTTP writer, remove its old resources:
-
-```sh
-kubectl -n logs delete deployment/log-writer service/log-writer networkpolicy/log-writer --ignore-not-found
-```
 
 The collector namespace must not be excluded from reconciliation. Keep it
 restricted to administrators: its credential can read logs from every collected
@@ -186,4 +178,3 @@ The optional SQL integration test starts a temporary, password-authenticated loc
 CockroachDB with supplied/generated certificates, then checks provisioning, retries,
 DDL, authentication, and tenant isolation. Kubernetes reconciliation uses a fake
 API client in unit tests. The Zebu installation is configured in `deploy/`.
-

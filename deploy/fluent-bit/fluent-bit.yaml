@@ -58,8 +58,47 @@ spec:
       - operator: Exists
       terminationGracePeriodSeconds: 60
       securityContext:
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      # pgsql requires separate host/port even when Database is a full URI.
+      # Render those from the Secret without writing credentials into the config.
+      initContainers:
+      - name: configure
+        image: python:3.13-alpine
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: roachkey
+              key: DATABASE_URL
+        command: [python3, -B, -c]
+        args:
+        - |
+          import os
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          url = urlsplit(os.environ["DATABASE_URL"])
+          if url.scheme not in ("postgres", "postgresql") or not url.hostname:
+              raise SystemExit("DATABASE_URL must be a PostgreSQL URL with a host")
+          config = Path("/fluent-bit/config/fluent-bit.conf").read_text()
+          config = config.replace("${DATABASE_HOST}", url.hostname)
+          config = config.replace("${DATABASE_PORT}", str(url.port or 5432))
+          Path("/fluent-bit/runtime/fluent-bit.conf").write_text(config)
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+        volumeMounts:
+        - name: config
+          mountPath: /fluent-bit/config
+          readOnly: true
+        - name: runtime
+          mountPath: /fluent-bit/runtime
       containers:
       - name: fluent-bit
         image: cr.fluentbit.io/fluent/fluent-bit:4.2.3
@@ -71,7 +110,7 @@ spec:
               key: DATABASE_URL
         args:
         - -c
-        - /fluent-bit/config/fluent-bit.conf
+        - /fluent-bit/runtime/fluent-bit.conf
         ports:
         - name: http
           containerPort: 2020
@@ -103,10 +142,12 @@ spec:
           readOnly: true
         - name: state
           mountPath: /var/lib/fluent-bit
-        - name: config
-          mountPath: /fluent-bit/config
+        - name: runtime
+          mountPath: /fluent-bit/runtime
           readOnly: true
       volumes:
+      - name: runtime
+        emptyDir: {}
       - name: config
         configMap:
           name: fluent-bit-config
