@@ -30,7 +30,7 @@ kubectl apply -f deploy/operator.yaml
 
 For the Zebu cluster, the configuration in `deploy/kustomization.yaml` uses
 `cockroachdb-secure-public.cockroach.svc.cluster.local:26257` with TLS
-and a pinned controller image. Install or update it with:
+and a pinned controller image, plus the Fluent Bit collector.
 
 Supply `roachmotel-system/roachmotel-admin` as above, then run:
 
@@ -61,6 +61,43 @@ as shown in the example. Admin connections can still use their own CA or client
 certificate files through the admin URL; these are never copied to application Secrets.
 CockroachDB must use password authentication; `--insecure` disables it and cannot
 provide namespace isolation.
+
+## Cluster container logs
+
+`deploy/` includes a Fluent Bit DaemonSet in the `logs` namespace. Its native
+[`pgsql` output](https://docs.fluentbit.io/manual/data-pipeline/outputs/postgresql)
+sends logs directly to CockroachDB with `CockroachDB On`, using the generated
+`roachkey` Secret's `DATABASE_URL`. No additional service or custom image is needed.
+The controller provisions database/user `logs` and the namespace's SQL NetworkPolicy.
+
+The DaemonSet tails `/var/log/containers/*.log` on every Linux node, including
+tainted nodes and all namespaces, parses Docker/CRI records, and adds Kubernetes
+metadata. All records go into **`logs.public.containers`**, which the output plugin
+creates with `tag`, `time`, and `data` (JSONB) columns. Namespace information stays
+in the source tag and Kubernetes metadata; there are no per-namespace tables.
+No default retention is imposed.
+
+Offsets and pending chunks persist on each node under
+`/var/lib/roachmotel-fluent-bit`. Retries are unlimited, with a 1 GiB queue per node;
+when full, oldest queued chunks are dropped. Lines larger than 1 MiB are skipped.
+Collection starts at the beginning of available files on first install. Logs
+already rotated away, host journal files, and application file-only logs are not
+collected. Delivery can duplicate records after retries.
+
+For a generic installation, apply `kubectl apply -k deploy/fluent-bit`. An init
+container derives the plugin's required host/port settings from `DATABASE_URL`;
+credentials and TLS settings come from that same Secret. No endpoint is configured
+separately. Output logging is restricted to errors because the plugin includes its
+Database setting in informational messages. Restart the DaemonSet after updating
+credentials: `kubectl -n logs rollout restart daemonset/fluent-bit`.
+The node layout assumes container log symlinks resolve within `/var/log` (as on
+containerd). Docker installations using `/var/lib/docker/containers` need an
+additional read-only host mount.
+
+The collector namespace must not be excluded from reconciliation. Keep it
+restricted to administrators: its credential can read logs from every collected
+namespace. Opt-out/re-enable retains the usual credentials and SQL/network
+revocation behavior.
 
 ## Behavior
 
