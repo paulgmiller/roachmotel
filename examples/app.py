@@ -1,4 +1,4 @@
-"""Read the namespace connection-string Secret for each fresh connection."""
+"""Read the namespace DATABASE_URL Secret for each fresh connection."""
 import os
 from pathlib import Path
 import time

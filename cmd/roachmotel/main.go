@@ -50,7 +50,7 @@ func main() {
 		if err == nil {
 			admin, parseErr := pgx.ParseConfig(strings.TrimSpace(string(raw)))
 			if parseErr == nil {
-				controller := operator.Controller{Client: client, DB: &operator.SQLDatabase{Config: admin}, Namespace: namespace, Template: template, Excluded: excluded, LogsNamespace: os.Getenv("LOGS_NAMESPACE")}
+				controller := operator.Controller{Client: client, DB: &operator.SQLDatabase{Config: admin}, Namespace: namespace, Template: template, Excluded: excluded}
 				pass, cancel := context.WithTimeout(ctx, 30*time.Second)
 				namespaces, listErr := client.CoreV1().Namespaces().List(pass, meta.ListOptions{})
 				cancel()
@@ -83,4 +83,3 @@ func main() {
 		}
 	}
 }
-

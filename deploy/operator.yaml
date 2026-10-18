@@ -77,8 +77,6 @@ spec:
               value: 'postgresql://cockroachdb-public.database.svc.cluster.local:26257/?sslmode=require'
             - name: EXCLUDED_NAMESPACES
               value: 'local-path-storage,cockroach-operator-system'
-            - name: LOGS_NAMESPACE
-              value: logs
           volumeMounts:
             - name: admin
               mountPath: /var/run/admin

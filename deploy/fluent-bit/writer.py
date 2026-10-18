@@ -91,7 +91,7 @@ if __name__ == "__main__":
 
     def connect():
         # Read the projected Secret again for every batch, including updates.
-        uri = Path("/credentials/connection-string").read_text().strip()
+        uri = Path("/credentials/DATABASE_URL").read_text().strip()
         return psycopg.connect(uri, connect_timeout=10,
                                options="-c statement_timeout=20000")
 

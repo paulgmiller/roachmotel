@@ -14,15 +14,24 @@ import (
 )
 
 type fakeDB struct {
-	revoked   []string
-	fail      bool
-	available bool
-	passwords []string
-	bootstrap []bool
+	revoked          []string
+	fail             bool
+	available        bool
+	passwords        []string
+	bootstrap        []bool
+	checked          []string
+	ensured          []string
+	existingDatabase bool
+	preserved        []bool
 }
 
-func (d *fakeDB) Available(context.Context, string) (bool, error) { return d.available, nil }
-func (d *fakeDB) Ensure(_ context.Context, _ string, password string, bootstrap bool) error {
+func (d *fakeDB) Available(_ context.Context, id string) (bool, bool, error) {
+	d.checked = append(d.checked, id)
+	return d.available, d.existingDatabase, nil
+}
+func (d *fakeDB) Ensure(_ context.Context, id string, password string, bootstrap, preserveExisting bool) error {
+	d.preserved = append(d.preserved, preserveExisting)
+	d.ensured = append(d.ensured, id)
 	d.passwords = append(d.passwords, password)
 	d.bootstrap = append(d.bootstrap, bootstrap)
 	if d.fail {
@@ -85,7 +94,7 @@ func TestRetryAndNamespaceRecreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	recreated, _ := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
-	if string(first.Data["connection-string"]) != string(recreated.Data["connection-string"]) {
+	if string(first.Data["DATABASE_URL"]) != string(recreated.Data["DATABASE_URL"]) {
 		t.Fatal("credentials changed after namespace recreation")
 	}
 	for _, p := range db.passwords {
@@ -103,7 +112,7 @@ func TestConflictsAndExclusions(t *testing.T) {
 	ctx := context.Background()
 	db.available = false
 	if c.Reconcile(ctx, ns) == nil {
-		t.Fatal("adopted an existing database")
+		t.Fatal("adopted an existing user")
 	}
 	db.available = true
 	_, err := c.Client.CoreV1().Secrets(ns.Name).Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: SecretName}}, meta.CreateOptions{})
@@ -127,6 +136,87 @@ func TestConflictsAndExclusions(t *testing.T) {
 	}
 	if len(db.passwords) != 0 {
 		t.Fatal("provisioned excluded namespace")
+	}
+}
+
+func TestExistingDatabasePreservedAcrossRetries(t *testing.T) {
+	c, db, ns := fixture(t)
+	db.existingDatabase = true
+	db.fail = true
+	ctx := context.Background()
+	if c.Reconcile(ctx, ns) == nil {
+		t.Fatal("expected SQL failure")
+	}
+	db.existingDatabase = false
+	db.fail = false
+	for i := 0; i < 2; i++ {
+		if err := c.Reconcile(ctx, ns); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(db.preserved) != 3 {
+		t.Fatalf("expected three SQL attempts: %v", db.preserved)
+	}
+	for _, preserve := range db.preserved {
+		if !preserve {
+			t.Fatal("retry would change existing database ownership or grants")
+		}
+	}
+}
+
+func TestLegacyCredentialPreservesExistingDatabase(t *testing.T) {
+	c, db, ns := fixture(t)
+	ctx := context.Background()
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	secrets := c.Client.CoreV1().Secrets(c.Namespace)
+	list, err := secrets.List(ctx, meta.ListOptions{})
+	if err != nil || len(list.Items) != 1 {
+		t.Fatal("expected retained credential", err)
+	}
+	master := &list.Items[0]
+	delete(master.Annotations, existingDatabaseKey)
+	if _, err := secrets.Update(ctx, master, meta.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	db.existingDatabase = true
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	if !db.preserved[len(db.preserved)-1] {
+		t.Fatal("upgrade would change existing database ownership or grants")
+	}
+	master, err = secrets.Get(ctx, master.Name, meta.GetOptions{})
+	if err != nil || master.Annotations[existingDatabaseKey] != "true" {
+		t.Fatal("upgrade did not retain existing database state", err)
+	}
+}
+
+func TestControllerIgnoresOtherCredentialSecret(t *testing.T) {
+	c, _, ns := fixture(t)
+	ctx := context.Background()
+	secrets := c.Client.CoreV1().Secrets(ns.Name)
+	ignored := &core.Secret{ObjectMeta: meta.ObjectMeta{Name: "roachmotel-credentials", Namespace: ns.Name, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}}, Data: map[string][]byte{"connection-string": []byte("leave alone")}}
+	if _, err := secrets.Create(ctx, ignored, meta.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c.Client.(*fake.Clientset).ClearActions()
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	ns.Annotations = map[string]string{EnabledAnnotation: "false"}
+	if err := c.Reconcile(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range c.Client.(*fake.Clientset).Actions() {
+		if get, ok := action.(interface{ GetName() string }); ok && get.GetName() == ignored.Name {
+			t.Fatalf("controller accessed ignored Secret: %s", action.GetVerb())
+		}
+	}
+	retained, err := secrets.Get(ctx, ignored.Name, meta.GetOptions{})
+	if err != nil || string(retained.Data["connection-string"]) != "leave alone" {
+		t.Fatal("controller changed ignored Secret", err)
 	}
 }
 
@@ -165,7 +255,7 @@ func TestNetworkPolicyAndAnnotationOptOut(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(db.revoked) != 2 || db.revoked[0] != Identity(ns.Name) {
+	if len(db.revoked) != 2 || db.revoked[0] != ns.Name || db.revoked[1] != ns.Name {
 		t.Fatal("did not revoke SQL access")
 	}
 	if _, err := policies.Get(ctx, name, meta.GetOptions{}); err == nil {
@@ -185,7 +275,7 @@ func TestNetworkPolicyAndAnnotationOptOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored, _ := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
-	if string(first.Data["connection-string"]) != string(restored.Data["connection-string"]) {
+	if string(first.Data["DATABASE_URL"]) != string(restored.Data["DATABASE_URL"]) {
 		t.Fatal("re-enable changed credentials")
 	}
 	if _, err := policies.Get(ctx, name, meta.GetOptions{}); err != nil {
@@ -295,8 +385,15 @@ func TestNetworkUsesServiceSQLTargetPort(t *testing.T) {
 }
 
 func TestCredentialsContainOnlyTLSRequiredConnectionString(t *testing.T) {
-	c, _, ns := fixture(t)
+	c, db, ns := fixture(t)
 	ctx := context.Background()
+	_, err := c.Client.CoreV1().Secrets(ns.Name).Create(ctx, &core.Secret{
+		ObjectMeta: meta.ObjectMeta{Name: "roachkey", Namespace: ns.Name, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}},
+		Data:       map[string][]byte{"DATABASE_URL": []byte("postgresql://rm_old:old@cockroachdb.database:26257/rm_old?sslmode=require")},
+	}, meta.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Reconcile(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
@@ -326,18 +423,28 @@ func TestCredentialsContainOnlyTLSRequiredConnectionString(t *testing.T) {
 	if len(secret.Data) != 1 {
 		t.Fatalf("unexpected credential keys: %v", secret.Data)
 	}
-	connection, err := url.Parse(string(secret.Data["connection-string"]))
+	connection, err := url.Parse(string(secret.Data["DATABASE_URL"]))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if connection.Query().Get("sslmode") != "require" || connection.Query().Get("connect_timeout") != "5" || connection.Query().Has("sslrootcert") {
 		t.Fatalf("unexpected application transport: %v", connection.Query())
 	}
+	if connection.User.Username() != ns.Name || connection.Path != "/"+ns.Name {
+		t.Fatalf("username and database must match namespace %q: %s", ns.Name, connection.Redacted())
+	}
+	if len(db.checked) != 1 || db.checked[0] != ns.Name {
+		t.Fatalf("checked wrong SQL identity: %v", db.checked)
+	}
+	for _, id := range db.ensured {
+		if id != ns.Name {
+			t.Fatalf("provisioned SQL identity %q instead of namespace %q", id, ns.Name)
+		}
+	}
 }
 
 func TestLogsNamespaceUsesLiteralDatabaseAndRetainsOptOutBehavior(t *testing.T) {
 	c, db, ns := fixture(t)
-	c.LogsNamespace = "logs"
 	ns.Name = "logs"
 	ctx := context.Background()
 	if err := c.Reconcile(ctx, ns); err != nil {
@@ -347,14 +454,11 @@ func TestLogsNamespaceUsesLiteralDatabaseAndRetainsOptOutBehavior(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	u, err := url.Parse(string(secret.Data["connection-string"]))
+	u, err := url.Parse(string(secret.Data["DATABASE_URL"]))
 	if err != nil || u.Path != "/logs" || u.User.Username() != "logs" {
 		t.Fatal("collector did not receive the logs database/user")
 	}
-	if c.identity("other") != Identity("other") {
-		t.Fatal("changed another tenant's identity")
-	}
-	if _, err := c.Client.NetworkingV1().NetworkPolicies("database").Get(ctx, "logs", meta.GetOptions{}); err != nil {
+	if _, err := c.Client.NetworkingV1().NetworkPolicies("database").Get(ctx, "rm-"+Identity(ns.Name)[3:], meta.GetOptions{}); err != nil {
 		t.Fatal("missing collector SQL policy", err)
 	}
 	ns.Annotations = map[string]string{EnabledAnnotation: "false"}
@@ -364,7 +468,7 @@ func TestLogsNamespaceUsesLiteralDatabaseAndRetainsOptOutBehavior(t *testing.T) 
 	if len(db.revoked) != 1 || db.revoked[0] != "logs" {
 		t.Fatal("did not revoke the logs identity")
 	}
-	if _, err := c.Client.NetworkingV1().NetworkPolicies("database").Get(ctx, "logs", meta.GetOptions{}); err == nil {
+	if _, err := c.Client.NetworkingV1().NetworkPolicies("database").Get(ctx, "rm-"+Identity(ns.Name)[3:], meta.GetOptions{}); err == nil {
 		t.Fatal("retained logs SQL policy after opt-out")
 	}
 	delete(ns.Annotations, EnabledAnnotation)
@@ -372,28 +476,16 @@ func TestLogsNamespaceUsesLiteralDatabaseAndRetainsOptOutBehavior(t *testing.T) 
 		t.Fatal(err)
 	}
 	restored, err := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
-	if err != nil || string(restored.Data["connection-string"]) != string(secret.Data["connection-string"]) {
+	if err != nil || string(restored.Data["DATABASE_URL"]) != string(secret.Data["DATABASE_URL"]) {
 		t.Fatal("collector credentials changed after re-enable")
 	}
 }
 
-func TestLogsNamespaceRefusesImplicitMigrationAndAdoption(t *testing.T) {
+func TestLogsNamespaceRefusesUserAdoption(t *testing.T) {
 	c, db, ns := fixture(t)
 	ns.Name = "logs"
-	ctx := context.Background()
-	if err := c.Reconcile(ctx, ns); err != nil {
-		t.Fatal(err)
-	}
-	c.LogsNamespace = "logs"
-	before := len(db.passwords)
-	if c.Reconcile(ctx, ns) == nil || len(db.passwords) != before {
-		t.Fatal("silently changed an existing namespace's database")
-	}
-	c, db, ns = fixture(t)
-	c.LogsNamespace = ns.Name
 	db.available = false
-	if c.Reconcile(ctx, ns) == nil || len(db.passwords) != 0 {
-		t.Fatal("adopted a pre-existing logs database or user")
+	if c.Reconcile(context.Background(), ns) == nil || len(db.passwords) != 0 {
+		t.Fatal("adopted a pre-existing logs user")
 	}
 }
-

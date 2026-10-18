@@ -64,7 +64,7 @@ spec:
       volumes:
         - name: credentials
           secret:
-            secretName: roachmotel-credentials
+            secretName: roachkey
             defaultMode: 0440
 ---
 apiVersion: networking.k8s.io/v1

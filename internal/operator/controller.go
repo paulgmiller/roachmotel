@@ -17,36 +17,29 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-const SecretName = "roachmotel-credentials"
+const SecretName = "roachkey"
 const EnabledAnnotation = "roachmotel.dev/enabled"
 const namespaceKey = "roachmotel.dev/namespace"
+const existingDatabaseKey = "roachmotel.dev/existing-database"
 
 type Database interface {
-	Available(context.Context, string) (bool, error)
-	Ensure(context.Context, string, string, bool) error
+	Available(context.Context, string) (bool, bool, error)
+	Ensure(context.Context, string, string, bool, bool) error
 	Revoke(context.Context, string) error
 }
 
 type Controller struct {
-	Client        kubernetes.Interface
-	DB            Database
-	Namespace     string
-	Template      *url.URL
-	Excluded      map[string]bool
-	LogsNamespace string
+	Client    kubernetes.Interface
+	DB        Database
+	Namespace string
+	Template  *url.URL
+	Excluded  map[string]bool
 }
 
+// Identity provides stable names for retained Kubernetes resources only.
 func Identity(namespace string) string {
 	hash := sha256.Sum256([]byte(namespace))
 	return "rm_" + hex.EncodeToString(hash[:16])
-}
-
-// identity reserves a literal logs database/user only for the configured collector namespace.
-func (c *Controller) identity(namespace string) string {
-	if c.LogsNamespace != "" && namespace == c.LogsNamespace {
-		return "logs"
-	}
-	return Identity(namespace)
 }
 
 func Password() (string, error) {
@@ -103,35 +96,23 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	if err := c.ensureNetwork(ctx, ns.Name, true); err != nil {
 		return err
 	}
-	id := c.identity(ns.Name)
-	if id == "logs" {
-		// Never silently switch a previously provisioned namespace to another database.
-		legacy := strings.ReplaceAll(Identity(ns.Name), "_", "-")
-		_, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, legacy, meta.GetOptions{})
-		if err == nil {
-			return errors.New("logs namespace already has hashed credentials; explicit migration required")
-		}
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
-	}
-	// SQL identifiers use underscores; Kubernetes Secret names require DNS names.
-	masterName := strings.ReplaceAll(id, "_", "-")
+	id := ns.Name
+	masterName := strings.ReplaceAll(Identity(ns.Name), "_", "-")
 	store := c.Client.CoreV1().Secrets(c.Namespace)
 	master, err := store.Get(ctx, masterName, meta.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		available, checkErr := c.DB.Available(ctx, id)
+		available, databaseExists, checkErr := c.DB.Available(ctx, id)
 		if checkErr != nil {
 			return checkErr
 		}
 		if !available {
-			return errors.New("database or username already exists without a retained credential; refusing adoption")
+			return errors.New("username already exists without a retained credential; refusing adoption")
 		}
 		password, passwordErr := Password()
 		if passwordErr != nil {
 			return passwordErr
 		}
-		master, err = store.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: masterName, Namespace: c.Namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}}, Type: core.SecretTypeOpaque, Data: map[string][]byte{"password": []byte(password)}}, meta.CreateOptions{})
+		master, err = store.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: masterName, Namespace: c.Namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name, existingDatabaseKey: fmt.Sprint(databaseExists)}}, Type: core.SecretTypeOpaque, Data: map[string][]byte{"password": []byte(password)}}, meta.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			master, err = store.Get(ctx, masterName, meta.GetOptions{})
 		}
@@ -143,8 +124,20 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	if master.Labels["app.kubernetes.io/managed-by"] != "roachmotel" || master.Annotations[namespaceKey] != ns.Name || len(master.Data["password"]) != 64 || passwordErr != nil {
 		return errors.New("invalid retained credential record")
 	}
+	if _, recorded := master.Annotations[existingDatabaseKey]; !recorded {
+		// Older records did not distinguish existing databases. Preserve them on upgrade.
+		_, exists, checkErr := c.DB.Available(ctx, id)
+		if checkErr != nil {
+			return checkErr
+		}
+		master.Annotations[existingDatabaseKey] = fmt.Sprint(exists)
+		master, err = store.Update(ctx, master, meta.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+	}
 	password := string(master.Data["password"])
-	if err := c.DB.Ensure(ctx, id, password, master.Annotations["roachmotel.dev/provisioned"] != "true"); err != nil {
+	if err := c.DB.Ensure(ctx, id, password, master.Annotations["roachmotel.dev/provisioned"] != "true", master.Annotations[existingDatabaseKey] == "true"); err != nil {
 		return err
 	}
 	if master.Annotations["roachmotel.dev/provisioned"] != "true" {
@@ -157,17 +150,21 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	u.User = url.UserPassword(id, password)
 	u.Path = "/" + id
 	u.RawPath = ""
-	data := map[string][]byte{"connection-string": []byte(u.String())}
-	target := c.Client.CoreV1().Secrets(ns.Name)
+	return c.publishCredential(ctx, ns.Name, u.String())
+}
+
+func (c *Controller) publishCredential(ctx context.Context, namespace, value string) error {
+	data := map[string][]byte{"DATABASE_URL": []byte(value)}
+	target := c.Client.CoreV1().Secrets(namespace)
 	secret, err := target.Get(ctx, SecretName, meta.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		_, err = target.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: SecretName, Namespace: ns.Name, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name}}, Type: core.SecretTypeOpaque, Data: data}, meta.CreateOptions{})
+		_, err = target.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: SecretName, Namespace: namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: namespace}}, Type: core.SecretTypeOpaque, Data: data}, meta.CreateOptions{})
 		return err
 	}
 	if err != nil {
 		return err
 	}
-	if secret.Labels["app.kubernetes.io/managed-by"] != "roachmotel" || secret.Annotations[namespaceKey] != ns.Name {
+	if !managed(secret, namespace) {
 		return errors.New("namespace Secret already exists and is not managed by roachmotel")
 	}
 	if secret.Immutable != nil && *secret.Immutable {
@@ -180,4 +177,3 @@ func (c *Controller) Reconcile(ctx context.Context, ns *core.Namespace) error {
 	_, err = target.Update(ctx, secret, meta.UpdateOptions{})
 	return err
 }
-
