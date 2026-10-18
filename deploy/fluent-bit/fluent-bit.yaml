@@ -63,6 +63,12 @@ spec:
       containers:
       - name: fluent-bit
         image: cr.fluentbit.io/fluent/fluent-bit:4.2.3
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: roachkey
+              key: DATABASE_URL
         args:
         - -c
         - /fluent-bit/config/fluent-bit.conf

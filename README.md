@@ -30,12 +30,7 @@ kubectl apply -f deploy/operator.yaml
 
 For the Zebu cluster, the configuration in `deploy/kustomization.yaml` uses
 `cockroachdb-secure-public.cockroach.svc.cluster.local:26257` with TLS
-and the Fluent Bit collector. Build and publish the log writer before installing:
-
-```sh
-docker build -f deploy/fluent-bit/Dockerfile -t paulgmiller/roachmotel-log-writer:fluent-bit .
-docker push paulgmiller/roachmotel-log-writer:fluent-bit
-```
+and the Fluent Bit collector.
 
 Supply `roachmotel-system/roachmotel-admin` as above, then run:
 
@@ -69,64 +64,48 @@ provide namespace isolation.
 
 ## Cluster container logs
 
-`deploy/` includes a Fluent Bit DaemonSet in a dedicated `logs` namespace. The
-controller creates SQL database/user `logs`, matching the namespace, and its
-usual `logs/roachkey` Secret with a `DATABASE_URL` key. No separate
-password or admin credential is supplied. Only the log writer mounts this required
-Secret; SQL access uses the controller's namespace NetworkPolicy. Deploy the
-updated controller image before creating the collector namespace.
+`deploy/` includes a Fluent Bit DaemonSet in the `logs` namespace. Its native
+[`pgsql` output](https://docs.fluentbit.io/manual/data-pipeline/outputs/postgresql)
+sends logs directly to CockroachDB with `CockroachDB On`, using the generated
+`roachkey` Secret's `DATABASE_URL`. No additional service or custom image is needed.
+The controller provisions database/user `logs` and the namespace's SQL NetworkPolicy.
 
 The DaemonSet tails `/var/log/containers/*.log` on every Linux node, including
-tainted nodes and all namespaces, parses Docker/CRI records and adds Kubernetes
-metadata. Its HTTP output sends each batch to the `log-writer` Service. The writer
-uses the mounted `DATABASE_URL` directly, including TLS settings, and
-re-reads it for each batch. Credentials never enter Fluent Bit configuration.
-An ingress NetworkPolicy restricts the writer to collector pods in `logs`.
-
-Each source namespace has its own table: `logs.public.default`,
-`logs.public."kube-system"`, etc. Tables are created on the first batch with
-`tag TEXT`, `time TIMESTAMPTZ`, and `data JSONB`. The namespace comes from the
-container log filename in Fluent Bit's source tag, so routing still works when
-Kubernetes metadata lookup fails. Namespace names are validated and quoted
-exactly, preventing collisions or SQL injection. A complete batch commits before
-HTTP success; failures return 503 so Fluent Bit can retry. The writer never changes
-an existing table's retention settings or drops tables when namespaces disappear.
-
-Configure independent retention once a table exists, using an admin connection:
-
-```sql
--- Seven days for application logs, measured from ingestion:
-ALTER TABLE logs.public."my-app" SET (ttl_expire_after = '7 days');
--- Thirty days for cluster infrastructure logs:
-ALTER TABLE logs.public."kube-system" SET (ttl_expire_after = '30 days');
-```
-
-`ttl_expire_after` adds CockroachDB's expiration column and uses ingestion time;
-`time` continues to store the original log timestamp. TTL deletion runs in the
-background. No default retention is imposed. See [row-level TTL documentation](https://www.cockroachlabs.com/docs/stable/row-level-ttl).
-If an earlier installation wrote `logs.public.containers`, its rows remain there;
-new batches go to namespace tables. Historical rows are not migrated or deleted.
+tainted nodes and all namespaces, parses Docker/CRI records, and adds Kubernetes
+metadata. All records go into **`logs.public.containers`**, which the output plugin
+creates with `tag`, `time`, and `data` (JSONB) columns. Namespace information stays
+in the source tag and Kubernetes metadata; there are no per-namespace tables.
+Existing namespace tables are left in place; historical rows are not moved or deleted.
+No default retention is imposed.
 
 Offsets and pending chunks persist on each node under
 `/var/lib/roachmotel-fluent-bit`. Retries are unlimited, with a 1 GiB queue per node;
 when full, oldest queued chunks are dropped. Lines larger than 1 MiB are skipped.
 Collection starts at the beginning of available files on first install. Logs
 already rotated away, host journal files, and application file-only logs are not
-collected. Delivery can duplicate records after retries. Database retention is
-not configured; manage it separately to limit growth.
+collected. Delivery can duplicate records after retries.
 
-For a generic installation, deploy the updated operator, then apply `kubectl apply -k deploy/fluent-bit`. The writer derives the SQL
-endpoint from the generated Secret. Build and publish its image using the Dockerfile
-shown above. The node layout assumes container log symlinks
-resolve within `/var/log` (as on containerd). Docker installations using
-`/var/lib/docker/containers` need an additional read-only host mount.
+For a generic installation, set the `Host` and `Port` in
+`deploy/fluent-bit/fluent-bit.conf` to match the operator's application endpoint,
+then apply `kubectl apply -k deploy/fluent-bit`. The plugin's explicit host/port
+settings override those in the URL; credentials and TLS settings come from the
+Secret. Output logging is restricted to errors because the plugin includes its
+Database setting in informational messages. Restart the DaemonSet after updating
+credentials: `kubectl -n logs rollout restart daemonset/fluent-bit`.
+The node layout assumes container log symlinks resolve within `/var/log` (as on
+containerd). Docker installations using `/var/lib/docker/containers` need an
+additional read-only host mount.
 
-Existing databases and users with hashed names require explicit data migration,
-as described below. An existing SQL `logs` user without a retained credential
-cannot be adopted. The collector namespace must not be excluded from
-reconciliation. Opt-out/re-enable retains the usual credentials and SQL/network
-revocation behavior. Keep the collector namespace restricted to administrators:
-its credential can read logs from every collected namespace.
+When upgrading an installation that used the HTTP writer, remove its old resources:
+
+```sh
+kubectl -n logs delete deployment/log-writer service/log-writer networkpolicy/log-writer --ignore-not-found
+```
+
+The collector namespace must not be excluded from reconciliation. Keep it
+restricted to administrators: its credential can read logs from every collected
+namespace. Opt-out/re-enable retains the usual credentials and SQL/network
+revocation behavior.
 
 ## Behavior
 
@@ -199,7 +178,6 @@ master credentials to rotate passwords; coordinated rotation remains future work
 
 ```sh
 go test ./...
-python3 -m unittest discover -s deploy/fluent-bit -p 'test_*.py' -v
 go build ./cmd/roachmotel
 COCKROACH=/path/to/cockroach go test ./internal/operator -run TestSQLIntegration -v
 ```

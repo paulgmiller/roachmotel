@@ -2,7 +2,6 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - fluent-bit.yaml
-  - log-writer.yaml
 configMapGenerator:
   - name: fluent-bit-config
     namespace: logs
