@@ -1,0 +1,11 @@
+spec:
+  template:
+    spec:
+      containers:
+        - name: letsmeetup
+          volumeMounts:
+            - mountPath: /var/run/roachmotel
+              $patch: delete
+      volumes:
+        - name: roachmotel-ca
+          $patch: delete

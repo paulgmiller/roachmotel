@@ -8,7 +8,7 @@ for its three replicas if it is running in Kubernetes.
 2. Reconcile non-system namespaces periodically, with opt-out labels/exclusions.
 3. Persist a random password in a retained operator-namespace Secret before SQL.
 4. Create the database/user, revoke PUBLIC grants, and grant namespace-local DDL/data access.
-5. Publish `roachmotel-credentials` with only a complete application URL using `sslmode=require`.
+5. Publish `roachkey` with only a `DATABASE_URL` key containing a complete application URL using `sslmode=require`.
 6. Retry partial failures and restore access after namespace recreation without deleting data.
 7. Apps explicitly mount/reference Secrets. No injection, certificate issuance, or rotation.
 8. Verify retries, conflict handling, namespace retention, SQL grants, and authentication.

@@ -6,7 +6,7 @@ resources:
 images:
   - name: roachmotel
     newName: paulgmiller/roachmotel
-    digest: sha256:a49b19673437e75a1988b9fed2c54f56eee868ecdfa0ed4aba5702db8194ea0a
+    digest: sha256:f83e94c07b79163650f8b05e3f9a5890221de61ee6de32f926774d08e9e5e715
 patches:
   - target:
       kind: Deployment
