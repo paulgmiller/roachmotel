@@ -62,7 +62,7 @@ func TestRetryAndNamespaceRecreation(t *testing.T) {
 	c, db, ns := fixture(t)
 	ctx := context.Background()
 	db.fail = true
-	if c.Reconcile(ctx, ns) == nil {
+	if c.reconcileNamespace(ctx, ns) == nil {
 		t.Fatal("expected SQL failure")
 	}
 	masters, err := c.Client.CoreV1().Secrets(c.Namespace).List(ctx, meta.ListOptions{})
@@ -80,7 +80,7 @@ func TestRetryAndNamespaceRecreation(t *testing.T) {
 		t.Fatal("published credentials before SQL success")
 	}
 	db.fail = false
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	first, _ := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
@@ -90,7 +90,7 @@ func TestRetryAndNamespaceRecreation(t *testing.T) {
 	if err := c.Client.CoreV1().Secrets(ns.Name).Delete(ctx, SecretName, meta.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	recreated, _ := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
@@ -111,7 +111,7 @@ func TestConflictsAndExclusions(t *testing.T) {
 	c, db, ns := fixture(t)
 	ctx := context.Background()
 	db.available = false
-	if c.Reconcile(ctx, ns) == nil {
+	if c.reconcileNamespace(ctx, ns) == nil {
 		t.Fatal("adopted an existing user")
 	}
 	db.available = true
@@ -119,19 +119,19 @@ func TestConflictsAndExclusions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Reconcile(ctx, ns) == nil {
+	if c.reconcileNamespace(ctx, ns) == nil {
 		t.Fatal("overwrote an unrelated Secret")
 	}
 	c, db, ns = fixture(t)
 	for _, name := range []string{"kube-system", c.Namespace} {
 		ns.Name = name
-		if err := c.Reconcile(ctx, ns); err != nil {
+		if err := c.reconcileNamespace(ctx, ns); err != nil {
 			t.Fatal(err)
 		}
 	}
 	ns.Name = "opt-out"
 	ns.Labels = map[string]string{"roachmotel.dev/enabled": "false"}
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	if len(db.passwords) != 0 {
@@ -144,13 +144,13 @@ func TestExistingDatabasePreservedAcrossRetries(t *testing.T) {
 	db.existingDatabase = true
 	db.fail = true
 	ctx := context.Background()
-	if c.Reconcile(ctx, ns) == nil {
+	if c.reconcileNamespace(ctx, ns) == nil {
 		t.Fatal("expected SQL failure")
 	}
 	db.existingDatabase = false
 	db.fail = false
 	for i := 0; i < 2; i++ {
-		if err := c.Reconcile(ctx, ns); err != nil {
+		if err := c.reconcileNamespace(ctx, ns); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -167,7 +167,7 @@ func TestExistingDatabasePreservedAcrossRetries(t *testing.T) {
 func TestLegacyCredentialPreservesExistingDatabase(t *testing.T) {
 	c, db, ns := fixture(t)
 	ctx := context.Background()
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	secrets := c.Client.CoreV1().Secrets(c.Namespace)
@@ -181,7 +181,7 @@ func TestLegacyCredentialPreservesExistingDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.existingDatabase = true
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	if !db.preserved[len(db.preserved)-1] {
@@ -202,11 +202,11 @@ func TestControllerIgnoresOtherCredentialSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.Client.(*fake.Clientset).ClearActions()
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	ns.Annotations = map[string]string{EnabledAnnotation: "false"}
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	for _, action := range c.Client.(*fake.Clientset).Actions() {
@@ -231,7 +231,7 @@ func TestTemplateCannotLeakAdminCredentials(t *testing.T) {
 func TestNetworkPolicyAndAnnotationOptOut(t *testing.T) {
 	c, db, ns := fixture(t)
 	ctx := context.Background()
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	policies := c.Client.NetworkingV1().NetworkPolicies("database")
@@ -251,7 +251,7 @@ func TestNetworkPolicyAndAnnotationOptOut(t *testing.T) {
 	first, _ := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
 	ns.Annotations = map[string]string{EnabledAnnotation: "false"}
 	for i := 0; i < 2; i++ {
-		if err := c.Reconcile(ctx, ns); err != nil {
+		if err := c.reconcileNamespace(ctx, ns); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -271,7 +271,7 @@ func TestNetworkPolicyAndAnnotationOptOut(t *testing.T) {
 		t.Fatal("master credentials removed", err)
 	}
 	delete(ns.Annotations, EnabledAnnotation)
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	restored, _ := c.Client.CoreV1().Secrets(ns.Name).Get(ctx, SecretName, meta.GetOptions{})
@@ -287,7 +287,7 @@ func TestOptOutRetriesAndDoesNotProvision(t *testing.T) {
 	c, db, ns := fixture(t)
 	ctx := context.Background()
 	ns.Annotations = map[string]string{EnabledAnnotation: "false"}
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	if len(db.passwords) != 0 || len(db.revoked) != 0 {
@@ -298,12 +298,12 @@ func TestOptOutRetriesAndDoesNotProvision(t *testing.T) {
 		t.Fatal("provisioned opted-out namespace")
 	}
 	delete(ns.Annotations, EnabledAnnotation)
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	ns.Annotations[EnabledAnnotation] = "false"
 	db.fail = true
-	if c.Reconcile(ctx, ns) == nil {
+	if c.reconcileNamespace(ctx, ns) == nil {
 		t.Fatal("SQL failure not retried")
 	}
 	policies, _ := c.Client.NetworkingV1().NetworkPolicies("database").List(ctx, meta.ListOptions{})
@@ -311,7 +311,7 @@ func TestOptOutRetriesAndDoesNotProvision(t *testing.T) {
 		t.Fatal("SQL failure prevented network cleanup")
 	}
 	db.fail = false
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -319,7 +319,7 @@ func TestOptOutRetriesAndDoesNotProvision(t *testing.T) {
 func TestNetworkPolicyRepairAndConflicts(t *testing.T) {
 	c, _, ns := fixture(t)
 	ctx := context.Background()
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	policies := c.Client.NetworkingV1().NetworkPolicies("database")
@@ -329,7 +329,7 @@ func TestNetworkPolicyRepairAndConflicts(t *testing.T) {
 	if _, err := policies.Update(ctx, policy, meta.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	policy, _ = policies.Get(ctx, name, meta.GetOptions{})
@@ -340,11 +340,11 @@ func TestNetworkPolicyRepairAndConflicts(t *testing.T) {
 	if _, err := policies.Update(ctx, policy, meta.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if c.Reconcile(ctx, ns) == nil {
+	if c.reconcileNamespace(ctx, ns) == nil {
 		t.Fatal("adopted unrelated policy")
 	}
 	ns.Annotations = map[string]string{EnabledAnnotation: "false"}
-	if c.Reconcile(ctx, ns) == nil {
+	if c.reconcileNamespace(ctx, ns) == nil {
 		t.Fatal("deleted unrelated policy")
 	}
 	if _, err := policies.Get(ctx, name, meta.GetOptions{}); err != nil {
@@ -363,7 +363,7 @@ func TestNetworkUsesServiceSQLTargetPort(t *testing.T) {
 		if _, err := services.Update(ctx, svc, meta.UpdateOptions{}); err != nil {
 			t.Fatal(err)
 		}
-		if err := c.Reconcile(ctx, ns); err != nil {
+		if err := c.reconcileNamespace(ctx, ns); err != nil {
 			t.Fatal(err)
 		}
 		policy, err := c.Client.NetworkingV1().NetworkPolicies("database").Get(ctx, "rm-"+Identity(ns.Name)[3:], meta.GetOptions{})
@@ -378,7 +378,7 @@ func TestNetworkUsesServiceSQLTargetPort(t *testing.T) {
 		if _, err := services.Update(ctx, svc, meta.UpdateOptions{}); err != nil {
 			t.Fatal(err)
 		}
-		if c.Reconcile(ctx, ns) == nil {
+		if c.reconcileNamespace(ctx, ns) == nil {
 			t.Fatal("accepted selectorless Service")
 		}
 	}
@@ -394,7 +394,7 @@ func TestCredentialsContainOnlyTLSRequiredConnectionString(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	secrets := c.Client.CoreV1().Secrets(ns.Name)
@@ -413,7 +413,7 @@ func TestCredentialsContainOnlyTLSRequiredConnectionString(t *testing.T) {
 	if _, err := secrets.Update(ctx, secret, meta.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Reconcile(ctx, ns); err != nil {
+	if err := c.reconcileNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	secret, err = secrets.Get(ctx, SecretName, meta.GetOptions{})

@@ -101,10 +101,29 @@ revocation behavior.
 
 ## Behavior
 
-The controller reconciles namespaces every 30 seconds, including existing ones.
+A controller-runtime manager reconciles existing namespaces at startup and watches
+namespace changes, managed Secrets, and managed NetworkPolicies. Changes to the
+admin Secret, CockroachDB Service, or infrastructure NetworkPolicy enqueue all
+namespaces. Successful reconciliations return without requesting a timed requeue;
+failures retry with the manager's rate-limited backoff.
+SQL-only changes require a relevant Kubernetes event or operator restart to reconcile.
 It skips `kube-*`, its own namespace, `EXCLUDED_NAMESPACES`, terminating namespaces,
 and the CockroachDB Service namespace. Retained credential Secret
 names use `rm-` plus the namespace hash to satisfy Kubernetes naming rules.
+
+Logs use `log/slog` with JSON output on stderr, including manager and Kubernetes client logs.
+Each entry has `time`, `level`, and `msg`. The manager logs reconciliation errors
+automatically with controller and namespace-object context and a credential-safe
+error. Startup failures exit with status 1.
+The admin URL is read from the Secret API on each reconciliation; TLS files remain
+on the mounted admin volume.
+
+Failures log the namespace, failed operation, and credential-safe diagnostics such as
+`ensure database access: connect to admin database: context deadline exceeded`, SQLSTATE
+codes, or Kubernetes API reasons and HTTP status codes. Raw driver/API messages, SQL
+statements, and connection strings are omitted because they can contain credentials.
+Unclassified errors log their Go type. Opt-out cleanup reports each failed operation.
+
 Infrastructure exclusions stop reconciliation without revoking existing access.
 Exclude other infrastructure namespaces explicitly.
 

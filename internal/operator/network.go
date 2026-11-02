@@ -3,7 +3,6 @@ package operator
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/url"
 	"reflect"
 	"strconv"
@@ -20,7 +19,7 @@ import (
 func NetworkService(u *url.URL) (string, string, error) {
 	parts := strings.Split(strings.TrimSuffix(u.Hostname(), "."), ".")
 	if len(parts) < 2 || (len(parts) > 2 && parts[2] != "svc") || parts[0] == "" || parts[1] == "" {
-		return "", "", errors.New("application endpoint must be a namespace-qualified Kubernetes Service DNS name")
+		return "", "", safeFailure("application endpoint must be a namespace-qualified Kubernetes Service DNS name")
 	}
 	return parts[1], parts[0], nil
 }
@@ -39,7 +38,7 @@ func (c *Controller) ensureNetwork(ctx context.Context, tenant string, allow boo
 		return err
 	}
 	if len(service.Spec.Selector) == 0 {
-		return errors.New("CockroachDB Service must have a pod selector")
+		return safeFailure("CockroachDB Service must have a pod selector")
 	}
 	port := 5432
 	if c.Template.Port() != "" {
@@ -59,7 +58,7 @@ func (c *Controller) ensureNetwork(ctx context.Context, tenant string, allow boo
 		}
 	}
 	if target == (intstr.IntOrString{}) {
-		return errors.New("application SQL port not found on CockroachDB Service")
+		return safeFailure("application SQL port not found on CockroachDB Service")
 	}
 	tcp := core.ProtocolTCP
 	sqlPorts := []networking.NetworkPolicyPort{{Protocol: &tcp, Port: &target}}
@@ -99,7 +98,7 @@ func (c *Controller) applyPolicy(ctx context.Context, desired *networking.Networ
 		return err
 	}
 	if !managed(existing, tenant) {
-		return fmt.Errorf("NetworkPolicy %s is not managed by roachmotel", desired.Name)
+		return safeFailure("NetworkPolicy is not managed by roachmotel")
 	}
 	if reflect.DeepEqual(existing.Spec, desired.Spec) {
 		return nil
@@ -116,7 +115,7 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 	var sqlErr error
 	if err == nil {
 		if !managed(master, ns.Name) {
-			return errors.New("invalid retained credential record")
+			return safeFailure("invalid retained credential record")
 		}
 		sqlErr = c.DB.Revoke(ctx, id)
 	} else if !apierrors.IsNotFound(err) {
@@ -129,7 +128,7 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 	policy, policyErr := policies.Get(ctx, masterName, meta.GetOptions{})
 	if policyErr == nil && networkErr == nil {
 		if !managed(policy, ns.Name) {
-			policyErr = errors.New("refusing to delete unrelated NetworkPolicy")
+			policyErr = safeFailure("refusing to delete unrelated NetworkPolicy")
 		} else {
 			uid := policy.UID
 			policyErr = policies.Delete(ctx, masterName, meta.DeleteOptions{Preconditions: &meta.Preconditions{UID: &uid}})
@@ -142,7 +141,7 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 	secret, secretErr := secrets.Get(ctx, SecretName, meta.GetOptions{})
 	if secretErr == nil {
 		if !managed(secret, ns.Name) {
-			secretErr = errors.New("refusing to delete unrelated Secret")
+			secretErr = safeFailure("refusing to delete unrelated Secret")
 		} else {
 			uid := secret.UID
 			secretErr = secrets.Delete(ctx, SecretName, meta.DeleteOptions{Preconditions: &meta.Preconditions{UID: &uid}})
@@ -151,5 +150,5 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 	if apierrors.IsNotFound(secretErr) {
 		secretErr = nil
 	}
-	return errors.Join(sqlErr, networkErr, policyErr, secretErr)
+	return errors.Join(atStage("revoke SQL access", sqlErr), atStage("ensure infrastructure policy", networkErr), atStage("remove tenant policy", policyErr), atStage("remove application credential", secretErr))
 }
