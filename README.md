@@ -111,18 +111,15 @@ It skips `kube-*`, its own namespace, `EXCLUDED_NAMESPACES`, terminating namespa
 and the CockroachDB Service namespace. Retained credential Secret
 names use `rm-` plus the namespace hash to satisfy Kubernetes naming rules.
 
-Logs use `log/slog` with JSON output on stderr, including manager and Kubernetes client logs.
-Each entry has `time`, `level`, and `msg`. The manager logs reconciliation errors
-automatically with controller and namespace-object context and a credential-safe
-error. Startup failures exit with status 1.
+Logs use controller-runtime's Zap logger with JSON output on stderr, including
+manager and Kubernetes client logs. Each entry has `ts`, `level`, and `msg`.
+The manager logs reconciliation errors automatically with controller and
+namespace-object context. Startup failures exit with status 1.
 The admin URL is read from the Secret API on each reconciliation; TLS files remain
 on the mounted admin volume.
 
-Failures log the namespace, failed operation, and credential-safe diagnostics such as
-`ensure database access: connect to admin database: context deadline exceeded`, SQLSTATE
-codes, or Kubernetes API reasons and HTTP status codes. Raw driver/API messages, SQL
-statements, and connection strings are omitted because they can contain credentials.
-Unclassified errors log their Go type. Opt-out cleanup reports each failed operation.
+Failures include the failed operation and original error message. Opt-out cleanup
+reports each failed operation.
 
 Infrastructure exclusions stop reconciliation without revoking existing access.
 Exclude other infrastructure namespaces explicitly.

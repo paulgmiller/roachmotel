@@ -57,32 +57,29 @@ func TestReconcile(t *testing.T) {
 	}
 }
 
-func TestReconcileSafeErrors(t *testing.T) {
+func TestReconcileErrorDetails(t *testing.T) {
 	ctx := context.Background()
 	c, _, ns := fixture(t)
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: ns.Name}}
+	cause := apierrors.NewForbidden(schema.GroupResource{Resource: "namespaces"}, ns.Name, errors.New("blocked by policy"))
 	c.Client.(*fake.Clientset).PrependReactor("get", "namespaces", func(ktesting.Action) (bool, runtime.Object, error) {
-		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "namespaces"}, "sensitive-password", errors.New("sensitive-password"))
+		return true, nil, cause
 	})
 	result, err := c.Reconcile(ctx, req)
-	if err == nil || err.Error() != "read namespace: Kubernetes API Forbidden (HTTP 403)" || !result.IsZero() {
+	if err == nil || err.Error() != "read namespace: "+cause.Error() || !errors.Is(err, cause) || !result.IsZero() {
 		t.Fatalf("unexpected error or requeue: %+v, %v", result, err)
-	}
-	if errors.Unwrap(err) != nil {
-		t.Fatal("manager can unwrap an unsafe error")
 	}
 
 	c, _, ns = fixture(t)
 	if _, err := c.Client.CoreV1().Namespaces().Create(ctx, ns, meta.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	// Secret API responses can contain credential values. The returned error
-	// itself must be safe because controller-runtime logs it automatically.
+	cause = apierrors.NewBadRequest("invalid Secret")
 	c.Client.(*fake.Clientset).PrependReactor("create", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
-		return true, nil, apierrors.NewBadRequest("sensitive-password")
+		return true, nil, cause
 	})
 	result, err = c.Reconcile(ctx, req)
-	if err == nil || err.Error() != "persist retained credential: Kubernetes API BadRequest (HTTP 400)" || !result.IsZero() {
+	if err == nil || err.Error() != "persist retained credential: "+cause.Error() || !errors.Is(err, cause) || !result.IsZero() {
 		t.Fatalf("unexpected error or requeue: %+v, %v", result, err)
 	}
 }
@@ -142,7 +139,7 @@ func TestAdminConfigurationReload(t *testing.T) {
 	}
 	c.DB = nil // Production loads the current admin URL for each reconciliation.
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: ns.Name}}
-	if _, err := c.Reconcile(ctx, req); err == nil || err.Error() != "read admin credential: Kubernetes API NotFound (HTTP 404)" {
+	if _, err := c.Reconcile(ctx, req); !apierrors.IsNotFound(err) || !strings.HasPrefix(err.Error(), "read admin credential:") {
 		t.Fatalf("expected missing admin Secret, got %v", err)
 	}
 	secret := &core.Secret{ObjectMeta: meta.ObjectMeta{Name: "roachmotel-admin", Namespace: c.Namespace}, Data: map[string][]byte{"connection-string": []byte("postgresql://root:sensitive-password@db:invalid/")}}
@@ -151,8 +148,8 @@ func TestAdminConfigurationReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = c.Reconcile(ctx, req)
-	if err == nil || !strings.Contains(err.Error(), "parse admin connection configuration") || strings.Contains(err.Error(), "sensitive-password") {
-		t.Fatalf("unsafe or missing configuration diagnostic: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "parse admin connection configuration") {
+		t.Fatalf("missing configuration diagnostic: %v", err)
 	}
 	secret.Data["connection-string"] = []byte("postgresql://root:sensitive-password@localhost:1/system?sslmode=disable")
 	if _, err := c.Client.CoreV1().Secrets(c.Namespace).Update(ctx, secret, meta.UpdateOptions{}); err != nil {
@@ -161,7 +158,7 @@ func TestAdminConfigurationReload(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	cancel() // Verify the new URL parsed without making a network connection.
 	_, err = c.Reconcile(ctx, req)
-	if err == nil || err.Error() != "check database availability: connect to admin database: context canceled" {
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "check database availability: connect to admin database:") {
 		t.Fatalf("did not reload corrected admin configuration: %v", err)
 	}
 	if c.DB != nil {

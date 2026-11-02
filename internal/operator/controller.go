@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/url"
 	"reflect"
@@ -54,18 +55,18 @@ func Password() (string, error) {
 func ValidateTemplate(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "postgresql" && u.Scheme != "postgres") || u.Host == "" || u.User != nil {
-		return nil, safeFailure("application URL template must be a PostgreSQL URL without user credentials")
+		return nil, errors.New("application URL template must be a PostgreSQL URL without user credentials")
 	}
 	q, err := url.ParseQuery(u.RawQuery)
 	if err != nil {
-		return nil, safeFailure("invalid application URL options")
+		return nil, errors.New("invalid application URL options")
 	}
 	if q.Get("sslmode") != "require" {
-		return nil, safeFailure("application template requires explicit sslmode=require")
+		return nil, errors.New("application template requires explicit sslmode=require")
 	}
 	for k, values := range q {
 		if len(values) != 1 {
-			return nil, safeFailure("duplicate application URL option")
+			return nil, errors.New("duplicate application URL option")
 		}
 		switch k {
 		case "sslmode", "connect_timeout":
@@ -74,7 +75,7 @@ func ValidateTemplate(raw string) (*url.URL, error) {
 		}
 	}
 	if u.Fragment != "" {
-		return nil, safeFailure("application URL cannot contain a fragment")
+		return nil, errors.New("application URL cannot contain a fragment")
 	}
 	return u, nil
 }
@@ -127,7 +128,7 @@ func (c *Controller) reconcileNamespace(ctx context.Context, ns *core.Namespace)
 			return checkErr
 		}
 		if !available {
-			return safeFailure("username already exists without a retained credential; refusing adoption")
+			return errors.New("username already exists without a retained credential; refusing adoption")
 		}
 		stage = "generate password"
 		password, passwordErr := Password()
@@ -146,7 +147,7 @@ func (c *Controller) reconcileNamespace(ctx context.Context, ns *core.Namespace)
 	stage = "validate retained credential"
 	_, passwordErr := hex.DecodeString(string(master.Data["password"]))
 	if master.Labels["app.kubernetes.io/managed-by"] != "roachmotel" || master.Annotations[namespaceKey] != ns.Name || len(master.Data["password"]) != 64 || passwordErr != nil {
-		return safeFailure("invalid retained credential record")
+		return errors.New("invalid retained credential record")
 	}
 	if _, recorded := master.Annotations[existingDatabaseKey]; !recorded {
 		// Older records did not distinguish existing databases. Preserve them on upgrade.
@@ -194,10 +195,10 @@ func (c *Controller) publishCredential(ctx context.Context, namespace, value str
 		return err
 	}
 	if !managed(secret, namespace) {
-		return safeFailure("namespace Secret already exists and is not managed by roachmotel")
+		return errors.New("namespace Secret already exists and is not managed by roachmotel")
 	}
 	if secret.Immutable != nil && *secret.Immutable {
-		return safeFailure("namespace credential Secret cannot be immutable")
+		return errors.New("namespace credential Secret cannot be immutable")
 	}
 	if reflect.DeepEqual(secret.Data, data) {
 		return nil

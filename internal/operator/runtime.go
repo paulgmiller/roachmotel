@@ -2,7 +2,6 @@ package operator
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	core "k8s.io/api/core/v1"
@@ -32,13 +31,6 @@ func (c *Controller) SetupWithManager(mgr ctrl.Manager) error {
 
 // Reconcile handles a namespace event from the manager's workqueue.
 func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (result reconcile.Result, err error) {
-	defer func() {
-		if err != nil {
-			// The manager logs returned errors automatically. Return only safe text,
-			// without an unwrap path to credentials in the original error.
-			err = errors.New(ErrorSummary(err))
-		}
-	}()
 	ns, err := c.Client.CoreV1().Namespaces().Get(ctx, req.Name, meta.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return result, nil
@@ -60,7 +52,7 @@ func (c *Controller) requestsForChange(ctx context.Context, obj client.Object) [
 	if adminChanged || serviceChanged || infrastructureChanged {
 		namespaces, err := c.Client.CoreV1().Namespaces().List(ctx, meta.ListOptions{})
 		if err != nil {
-			log.FromContext(ctx).Error(errors.New(ErrorSummary(err)), "cannot enqueue namespaces after configuration change")
+			log.FromContext(ctx).Error(err, "cannot enqueue namespaces after configuration change")
 			return nil
 		}
 		requests := make([]reconcile.Request, 0, len(namespaces.Items))

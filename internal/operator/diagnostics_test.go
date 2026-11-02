@@ -2,72 +2,27 @@ package operator
 
 import (
 	"context"
-	"crypto/x509"
 	"errors"
-	"fmt"
-	"net"
-	"net/url"
 	"strings"
-	"syscall"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
-
-func TestErrorSummary(t *testing.T) {
-	const secret = "sensitive-password"
-	tests := []struct {
-		name string
-		err  error
-		want string
-	}{
-		{"nil", nil, ""},
-		{"timeout", atStage("ensure database access", fmt.Errorf("%s: %w", secret, context.DeadlineExceeded)), "ensure database access: context deadline exceeded"},
-		{"canceled", context.Canceled, "context canceled"},
-		{"connection refused", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, "connection refused"},
-		{"network timeout", &net.DNSError{Err: secret, Name: secret, IsTimeout: true}, "DNS lookup failed"},
-		{"certificate", x509.HostnameError{Host: secret}, "TLS certificate verification failed"},
-		{"SQL password", &pgconn.PgError{Code: "42601", Message: "syntax error in ALTER USER WITH PASSWORD '" + secret + "'", Detail: secret, Hint: secret, InternalQuery: secret}, "SQL error (SQLSTATE 42601)"},
-		{"SQL authentication", fmt.Errorf("%s: %w", secret, &pgconn.PgError{Code: "28P01", Message: secret}), "SQL error (SQLSTATE 28P01)"},
-		{"invalid SQLSTATE", &pgconn.PgError{Code: secret, Message: secret}, "SQL error"},
-		{"API forbidden", apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, secret, errors.New(secret)), "Kubernetes API Forbidden (HTTP 403)"},
-		{"API secret validation", apierrors.NewInvalid(schema.GroupKind{Kind: "Secret"}, secret, field.ErrorList{field.Invalid(field.NewPath("data"), secret, secret)}), "Kubernetes API Invalid (HTTP 422)"},
-		{"API unknown reason", &apierrors.StatusError{ErrStatus: meta.Status{Reason: meta.StatusReason(secret), Message: secret, Code: 500}}, "Kubernetes API unknown reason (HTTP 500)"},
-		{"malformed connection", pgconn.NewParseConfigError("postgres://root:"+secret+"@db", secret, nil), "unclassified error (*pgconn.ParseConfigError)"},
-		{"URL", &url.Error{Op: secret, URL: "postgres://root:" + secret + "@db", Err: errors.New(secret)}, "unclassified error (*errors.errorString)"},
-		{"operator refusal", safeFailure("invalid retained credential record"), "invalid retained credential record"},
-		{"joined cleanup", errors.Join(atStage("revoke SQL access", context.DeadlineExceeded), atStage("remove application credential", apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, secret, errors.New(secret)))), "revoke SQL access: context deadline exceeded; remove application credential: Kubernetes API Forbidden (HTTP 403)"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ErrorSummary(tt.err)
-			if got != tt.want {
-				t.Fatalf("got %q, want %q", got, tt.want)
-			}
-			if strings.Contains(got, secret) {
-				t.Fatal("summary leaked credentials")
-			}
-		})
-	}
-}
 
 func TestReconciliationErrorStages(t *testing.T) {
 	t.Run("network API", func(t *testing.T) {
 		c, _, ns := fixture(t)
 		c.Client.(*fake.Clientset).PrependReactor("get", "services", func(ktesting.Action) (bool, runtime.Object, error) {
-			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "services"}, "db", errors.New("sensitive-password"))
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "services"}, "db", errors.New("blocked by policy"))
 		})
 		err := c.reconcileNamespace(context.Background(), ns)
-		want := "ensure network access: Kubernetes API Forbidden (HTTP 403)"
-		if got := ErrorSummary(err); got != want {
+		want := `ensure network access: services "db" is forbidden: blocked by policy`
+		if got := err.Error(); got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
 	})
@@ -79,7 +34,7 @@ func TestReconciliationErrorStages(t *testing.T) {
 			t.Fatalf("lost original timeout: %v", err)
 		}
 		want := "check database availability: context deadline exceeded"
-		if got := ErrorSummary(err); got != want {
+		if got := err.Error(); got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
 	})
@@ -114,8 +69,8 @@ func TestSQLConnectionErrorStage(t *testing.T) {
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("lost original cancellation: %v", err)
 			}
-			if got, want := ErrorSummary(err), "connect to admin database: context canceled"; got != want {
-				t.Fatalf("got %q, want %q", got, want)
+			if !strings.HasPrefix(err.Error(), "connect to admin database:") {
+				t.Fatalf("missing connection context: %v", err)
 			}
 		})
 	}

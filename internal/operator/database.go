@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -86,7 +87,7 @@ func (d *SQLDatabase) Ensure(ctx context.Context, id, password string, bootstrap
 		return err
 	}
 	if owner != config.User {
-		return safeFailure("managed database ownership changed; refusing reconciliation")
+		return errors.New("managed database ownership changed; refusing reconciliation")
 	}
 	stage = "reconcile database privileges"
 	for _, statement := range []string{
