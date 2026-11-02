@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	core "k8s.io/api/core/v1"
@@ -26,7 +27,7 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		return result, nil
 	}
 	if err != nil {
-		return result, atStage("read namespace", err)
+		return result, fmt.Errorf("read namespace: %w", err)
 	}
 	return result, c.reconcileNamespace(ctx, ns)
 }

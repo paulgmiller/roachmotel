@@ -79,92 +79,86 @@ func ValidateTemplate(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-func (c *Controller) reconcileNamespace(ctx context.Context, ns *core.Namespace) (err error) {
-	stage := "resolve database service"
-	defer func() { err = atStage(stage, err) }()
+func (c *Controller) reconcileNamespace(ctx context.Context, ns *core.Namespace) error {
 	if ns.DeletionTimestamp != nil || ns.Name == c.Namespace || c.Excluded[ns.Name] || strings.HasPrefix(ns.Name, "kube-") {
 		return nil
 	}
 	dbNamespace, _, err := NetworkService(c.Template)
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve database service: %w", err)
 	}
 	if ns.Name == dbNamespace {
 		return nil
 	}
 	if ns.Annotations[EnabledAnnotation] == "false" || ns.Labels[EnabledAnnotation] == "false" {
-		stage = "revoke access"
-		return c.revoke(ctx, ns)
+		if err := c.revoke(ctx, ns); err != nil {
+			return fmt.Errorf("revoke access: %w", err)
+		}
+		return nil
 	}
-	stage = "ensure network access"
 	if err := c.ensureNetwork(ctx, ns.Name, true); err != nil {
-		return err
+		return fmt.Errorf("ensure network access: %w", err)
 	}
 	id := ns.Name
 	masterName := strings.ReplaceAll(Identity(ns.Name), "_", "-")
 	store := c.Client.CoreV1().Secrets(c.Namespace)
-	stage = "read retained credential"
 	master, err := store.Get(ctx, masterName, meta.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		stage = "check database availability"
 		available, databaseExists, checkErr := c.DB.Available(ctx, id)
 		if checkErr != nil {
-			return checkErr
+			return fmt.Errorf("check database availability: %w", checkErr)
 		}
 		if !available {
 			return errors.New("username already exists without a retained credential; refusing adoption")
 		}
-		stage = "generate password"
 		password, passwordErr := Password()
 		if passwordErr != nil {
-			return passwordErr
+			return fmt.Errorf("generate password: %w", passwordErr)
 		}
-		stage = "persist retained credential"
 		master, err = store.Create(ctx, &core.Secret{ObjectMeta: meta.ObjectMeta{Name: masterName, Namespace: c.Namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "roachmotel"}, Annotations: map[string]string{namespaceKey: ns.Name, existingDatabaseKey: fmt.Sprint(databaseExists)}}, Type: core.SecretTypeOpaque, Data: map[string][]byte{"password": []byte(password)}}, meta.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			master, err = store.Get(ctx, masterName, meta.GetOptions{})
 		}
+		if err != nil {
+			return fmt.Errorf("persist retained credential: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("read retained credential: %w", err)
 	}
-	if err != nil {
-		return err
-	}
-	stage = "validate retained credential"
 	_, passwordErr := hex.DecodeString(string(master.Data["password"]))
 	if master.Labels["app.kubernetes.io/managed-by"] != "roachmotel" || master.Annotations[namespaceKey] != ns.Name || len(master.Data["password"]) != 64 || passwordErr != nil {
 		return errors.New("invalid retained credential record")
 	}
 	if _, recorded := master.Annotations[existingDatabaseKey]; !recorded {
 		// Older records did not distinguish existing databases. Preserve them on upgrade.
-		stage = "check existing database"
 		_, exists, checkErr := c.DB.Available(ctx, id)
 		if checkErr != nil {
-			return checkErr
+			return fmt.Errorf("check existing database: %w", checkErr)
 		}
 		master.Annotations[existingDatabaseKey] = fmt.Sprint(exists)
-		stage = "record existing database"
 		master, err = store.Update(ctx, master, meta.UpdateOptions{})
 		if err != nil {
-			return err
+			return fmt.Errorf("record existing database: %w", err)
 		}
 	}
 	password := string(master.Data["password"])
-	stage = "ensure database access"
 	if err := c.DB.Ensure(ctx, id, password, master.Annotations["roachmotel.dev/provisioned"] != "true", master.Annotations[existingDatabaseKey] == "true"); err != nil {
-		return err
+		return fmt.Errorf("ensure database access: %w", err)
 	}
 	if master.Annotations["roachmotel.dev/provisioned"] != "true" {
 		master.Annotations["roachmotel.dev/provisioned"] = "true"
-		stage = "mark credential provisioned"
 		if _, err := store.Update(ctx, master, meta.UpdateOptions{}); err != nil {
-			return err
+			return fmt.Errorf("mark credential provisioned: %w", err)
 		}
 	}
 	u := *c.Template
 	u.User = url.UserPassword(id, password)
 	u.Path = "/" + id
 	u.RawPath = ""
-	stage = "publish application credential"
-	return c.publishCredential(ctx, ns.Name, u.String())
+	if err := c.publishCredential(ctx, ns.Name, u.String()); err != nil {
+		return fmt.Errorf("publish application credential: %w", err)
+	}
+	return nil
 }
 
 func (c *Controller) publishCredential(ctx context.Context, namespace, value string) error {

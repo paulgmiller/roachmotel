@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"reflect"
 	"strconv"
@@ -118,11 +119,17 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 			return errors.New("invalid retained credential record")
 		}
 		sqlErr = c.DB.Revoke(ctx, id)
+		if sqlErr != nil {
+			sqlErr = fmt.Errorf("revoke SQL access: %w", sqlErr)
+		}
 	} else if !apierrors.IsNotFound(err) {
-		sqlErr = err
+		sqlErr = fmt.Errorf("read retained credential: %w", err)
 	}
 	// Attempt all cleanup even when SQL or an API operation temporarily fails.
 	networkErr := c.ensureNetwork(ctx, ns.Name, false)
+	if networkErr != nil {
+		networkErr = fmt.Errorf("ensure infrastructure policy: %w", networkErr)
+	}
 	namespace, _, _ := NetworkService(c.Template)
 	policies := c.Client.NetworkingV1().NetworkPolicies(namespace)
 	policy, policyErr := policies.Get(ctx, masterName, meta.GetOptions{})
@@ -136,6 +143,8 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 	}
 	if apierrors.IsNotFound(policyErr) {
 		policyErr = nil
+	} else if policyErr != nil {
+		policyErr = fmt.Errorf("remove tenant policy: %w", policyErr)
 	}
 	secrets := c.Client.CoreV1().Secrets(ns.Name)
 	secret, secretErr := secrets.Get(ctx, SecretName, meta.GetOptions{})
@@ -149,6 +158,8 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 	}
 	if apierrors.IsNotFound(secretErr) {
 		secretErr = nil
+	} else if secretErr != nil {
+		secretErr = fmt.Errorf("remove application credential: %w", secretErr)
 	}
-	return errors.Join(atStage("revoke SQL access", sqlErr), atStage("ensure infrastructure policy", networkErr), atStage("remove tenant policy", policyErr), atStage("remove application credential", secretErr))
+	return errors.Join(sqlErr, networkErr, policyErr, secretErr)
 }
