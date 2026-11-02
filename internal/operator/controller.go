@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
 	core "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,7 +30,7 @@ type Database interface {
 
 type Controller struct {
 	Client    kubernetes.Interface
-	DB        Database // Nil loads the current admin Secret when reconciling a request.
+	DB        Database
 	Namespace string
 	Template  *url.URL
 	Excluded  map[string]bool
@@ -92,21 +91,6 @@ func (c *Controller) reconcileNamespace(ctx context.Context, ns *core.Namespace)
 	}
 	if ns.Name == dbNamespace {
 		return nil
-	}
-	if c.DB == nil {
-		// Read the URL from the API: the mounted Secret may lag behind this event.
-		// TLS files remain on the mounted admin volume.
-		stage = "read admin credential"
-		secret, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, "roachmotel-admin", meta.GetOptions{})
-		if err != nil {
-			return err
-		}
-		stage = "parse admin connection configuration"
-		config, err := pgx.ParseConfig(strings.TrimSpace(string(secret.Data["connection-string"])))
-		if err != nil {
-			return err
-		}
-		c.DB = &SQLDatabase{Config: config}
 	}
 	if ns.Annotations[EnabledAnnotation] == "false" || ns.Labels[EnabledAnnotation] == "false" {
 		stage = "revoke access"

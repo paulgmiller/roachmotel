@@ -4,7 +4,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/paulgmiller/roachmotel/internal/operator"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
@@ -17,6 +19,7 @@ func main() {
 	logger := zap.New()
 	ctrl.SetLogger(logger)
 	klog.SetLogger(logger)
+	ctx := ctrl.SetupSignalHandler()
 	namespace := os.Getenv("POD_NAMESPACE")
 	if namespace == "" {
 		logger.Error(nil, "POD_NAMESPACE is required")
@@ -41,6 +44,16 @@ func main() {
 		logger.Error(err, "cannot create Kubernetes client")
 		os.Exit(1)
 	}
+	secret, err := client.CoreV1().Secrets(namespace).Get(ctx, "roachmotel-admin", meta.GetOptions{})
+	if err != nil {
+		logger.Error(err, "cannot read admin credential")
+		os.Exit(1)
+	}
+	admin, err := pgx.ParseConfig(strings.TrimSpace(string(secret.Data["connection-string"])))
+	if err != nil {
+		logger.Error(err, "invalid admin connection configuration")
+		os.Exit(1)
+	}
 	excluded := map[string]bool{}
 	for _, ns := range strings.Split(os.Getenv("EXCLUDED_NAMESPACES"), ",") {
 		excluded[strings.TrimSpace(ns)] = true
@@ -53,13 +66,14 @@ func main() {
 		os.Exit(1)
 	}
 	controller := &operator.Controller{
-		Client: client, Namespace: namespace, Template: template, Excluded: excluded,
+		Client: client, DB: &operator.SQLDatabase{Config: admin},
+		Namespace: namespace, Template: template, Excluded: excluded,
 	}
 	if err := controller.SetupWithManager(mgr); err != nil {
 		logger.Error(err, "cannot register namespace controller")
 		os.Exit(1)
 	}
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		logger.Error(err, "controller manager failed")
 		os.Exit(1)
 	}

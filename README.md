@@ -102,11 +102,10 @@ revocation behavior.
 ## Behavior
 
 A controller-runtime manager reconciles existing namespaces at startup and watches
-namespace changes, managed Secrets, and managed NetworkPolicies. Changes to the
-admin Secret, CockroachDB Service, or infrastructure NetworkPolicy enqueue all
-namespaces. Successful reconciliations return without requesting a timed requeue;
-failures retry with the manager's rate-limited backoff.
-SQL-only changes require a relevant Kubernetes event or operator restart to reconcile.
+namespace changes. Successful reconciliations return without requesting a timed
+requeue; failures retry with the manager's rate-limited backoff. Changes to Secrets,
+NetworkPolicies, Services, or SQL do not trigger reconciliation; repair happens on
+a namespace event or operator restart.
 It skips `kube-*`, its own namespace, `EXCLUDED_NAMESPACES`, terminating namespaces,
 and the CockroachDB Service namespace. Retained credential Secret
 names use `rm-` plus the namespace hash to satisfy Kubernetes naming rules.
@@ -115,8 +114,8 @@ Logs use controller-runtime's Zap logger with JSON output on stderr, including
 manager and Kubernetes client logs. Each entry has `ts`, `level`, and `msg`.
 The manager logs reconciliation errors automatically with controller and
 namespace-object context. Startup failures exit with status 1.
-The admin URL is read from the Secret API on each reconciliation; TLS files remain
-on the mounted admin volume.
+The admin URL is read from the Secret API once at startup; restart the operator
+after changing it. TLS files remain on the mounted admin volume.
 
 Failures include the failed operation and original error message. Opt-out cleanup
 reports each failed operation.
