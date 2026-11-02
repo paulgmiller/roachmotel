@@ -3,8 +3,10 @@ package operator
 import (
 	"context"
 	"errors"
-	"github.com/jackc/pgx/v5"
+	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type SQLDatabase struct{ Config *pgx.ConnConfig }
@@ -15,24 +17,27 @@ func quote(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"
 func (d *SQLDatabase) Available(ctx context.Context, id string) (bool, bool, error) {
 	conn, err := pgx.ConnectConfig(ctx, d.Config.Copy())
 	if err != nil {
-		return false, false, err
+		return false, false, fmt.Errorf("connect to admin database: %w", err)
 	}
 	defer conn.Close(ctx)
 	var userExists, databaseExists bool
 	err = conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM [SHOW USERS] WHERE username=$1), EXISTS(SELECT 1 FROM [SHOW DATABASES] WHERE database_name=$1)", id).Scan(&userExists, &databaseExists)
-	return !userExists, databaseExists, err
+	if err != nil {
+		return false, false, fmt.Errorf("query database and user existence: %w", err)
+	}
+	return !userExists, databaseExists, nil
 }
 
 func (d *SQLDatabase) Ensure(ctx context.Context, id, password string, bootstrap, preserveExisting bool) error {
 	conn, err := pgx.ConnectConfig(ctx, d.Config.Copy())
 	if err != nil {
-		return err
+		return fmt.Errorf("connect to admin database: %w", err)
 	}
 	defer conn.Close(ctx)
 	name := quote(id)
 	var userExists bool
 	if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM [SHOW USERS] WHERE username=$1)", id).Scan(&userExists); err != nil {
-		return err
+		return fmt.Errorf("query user existence: %w", err)
 	}
 	// Persisted credentials precede SQL: each step can be retried after a crash.
 	for _, statement := range []string{
@@ -40,19 +45,19 @@ func (d *SQLDatabase) Ensure(ctx context.Context, id, password string, bootstrap
 		"CREATE DATABASE IF NOT EXISTS " + name,
 	} {
 		if _, err := conn.Exec(ctx, statement); err != nil {
-			return err
+			return fmt.Errorf("create user and database: %w", err)
 		}
 	}
 	if bootstrap || !userExists {
 		if _, err := conn.Exec(ctx, "ALTER USER "+name+" WITH PASSWORD '"+strings.ReplaceAll(password, "'", "''")+"'"); err != nil {
-			return err
+			return fmt.Errorf("set user password: %w", err)
 		}
 	}
 	config := d.Config.Copy()
 	config.Database = id
 	db, err := pgx.ConnectConfig(ctx, config)
 	if err != nil {
-		return err
+		return fmt.Errorf("connect to tenant database: %w", err)
 	}
 	defer db.Close(ctx)
 	if preserveExisting {
@@ -65,14 +70,14 @@ func (d *SQLDatabase) Ensure(ctx context.Context, id, password string, bootstrap
 			"ALTER USER " + name + " WITH LOGIN",
 		} {
 			if _, err := db.Exec(ctx, statement); err != nil {
-				return err
+				return fmt.Errorf("grant database access: %w", err)
 			}
 		}
 		return nil
 	}
 	var owner string
 	if err := db.QueryRow(ctx, "SELECT owner FROM [SHOW DATABASES] WHERE database_name=$1", id).Scan(&owner); err != nil {
-		return err
+		return fmt.Errorf("check database ownership: %w", err)
 	}
 	if owner != config.User {
 		return errors.New("managed database ownership changed; refusing reconciliation")
@@ -86,7 +91,7 @@ func (d *SQLDatabase) Ensure(ctx context.Context, id, password string, bootstrap
 		"ALTER USER " + name + " WITH LOGIN",
 	} {
 		if _, err := db.Exec(ctx, statement); err != nil {
-			return err
+			return fmt.Errorf("reconcile database privileges: %w", err)
 		}
 	}
 	return nil
@@ -96,25 +101,27 @@ func (d *SQLDatabase) Ensure(ctx context.Context, id, password string, bootstrap
 func (d *SQLDatabase) Revoke(ctx context.Context, id string) error {
 	conn, err := pgx.ConnectConfig(ctx, d.Config.Copy())
 	if err != nil {
-		return err
+		return fmt.Errorf("connect to admin database: %w", err)
 	}
 	defer conn.Close(ctx)
 	var userExists, databaseExists bool
 	if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM [SHOW USERS] WHERE username=$1), EXISTS(SELECT 1 FROM [SHOW DATABASES] WHERE database_name=$1)", id).Scan(&userExists, &databaseExists); err != nil {
-		return err
+		return fmt.Errorf("query user existence: %w", err)
 	}
 	if !userExists {
 		return nil
 	}
 	name := quote(id)
 	if _, err := conn.Exec(ctx, "ALTER USER "+name+" WITH NOLOGIN"); err != nil {
-		return err
+		return fmt.Errorf("disable user login: %w", err)
 	}
 	if _, err := conn.Exec(ctx, "CANCEL SESSIONS IF EXISTS SELECT session_id FROM [SHOW CLUSTER SESSIONS] WHERE user_name=$1", id); err != nil {
-		return err
+		return fmt.Errorf("cancel user sessions: %w", err)
 	}
 	if databaseExists {
-		_, err = conn.Exec(ctx, "REVOKE ALL ON DATABASE "+name+" FROM "+name)
+		if _, err := conn.Exec(ctx, "REVOKE ALL ON DATABASE "+name+" FROM "+name); err != nil {
+			return fmt.Errorf("revoke database privileges: %w", err)
+		}
 	}
-	return err
+	return nil
 }

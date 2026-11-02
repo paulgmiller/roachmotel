@@ -1,85 +1,80 @@
 package main
 
 import (
-	"context"
-	"log"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/paulgmiller/roachmotel/internal/operator"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
+	logger := zap.New()
+	ctrl.SetLogger(logger)
+	klog.SetLogger(logger)
+	ctx := ctrl.SetupSignalHandler()
 	namespace := os.Getenv("POD_NAMESPACE")
 	if namespace == "" {
-		log.Fatal("POD_NAMESPACE is required")
+		logger.Error(nil, "POD_NAMESPACE is required")
+		os.Exit(1)
 	}
 	template, err := operator.ValidateTemplate(os.Getenv("APPLICATION_URL_TEMPLATE"))
 	if err != nil {
-		log.Fatal(err)
+		logger.Error(err, "invalid application configuration")
+		os.Exit(1)
 	}
 	if _, _, err := operator.NetworkService(template); err != nil {
-		log.Fatal(err)
+		logger.Error(err, "invalid application configuration")
+		os.Exit(1)
 	}
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		log.Fatal("cannot configure Kubernetes client")
+		logger.Error(err, "cannot configure Kubernetes client")
+		os.Exit(1)
 	}
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatal("cannot create Kubernetes client")
+		logger.Error(err, "cannot create Kubernetes client")
+		os.Exit(1)
+	}
+	secret, err := client.CoreV1().Secrets(namespace).Get(ctx, "roachmotel-admin", meta.GetOptions{})
+	if err != nil {
+		logger.Error(err, "cannot read admin credential")
+		os.Exit(1)
+	}
+	admin, err := pgx.ParseConfig(strings.TrimSpace(string(secret.Data["connection-string"])))
+	if err != nil {
+		logger.Error(err, "invalid admin connection configuration")
+		os.Exit(1)
 	}
 	excluded := map[string]bool{}
 	for _, ns := range strings.Split(os.Getenv("EXCLUDED_NAMESPACES"), ",") {
 		excluded[strings.TrimSpace(ns)] = true
 	}
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		// Re-read the mounted admin URL every pass, including after Secret changes.
-		raw, err := os.ReadFile("/var/run/admin/connection-string")
-		if err == nil {
-			admin, parseErr := pgx.ParseConfig(strings.TrimSpace(string(raw)))
-			if parseErr == nil {
-				controller := operator.Controller{Client: client, DB: &operator.SQLDatabase{Config: admin}, Namespace: namespace, Template: template, Excluded: excluded}
-				pass, cancel := context.WithTimeout(ctx, 30*time.Second)
-				namespaces, listErr := client.CoreV1().Namespaces().List(pass, meta.ListOptions{})
-				cancel()
-				if listErr != nil {
-					log.Print("namespace list failed; retrying")
-				} else {
-					for i := range namespaces.Items {
-						attempt, done := context.WithTimeout(ctx, 15*time.Second)
-						ns := &namespaces.Items[i]
-						if err := controller.Reconcile(attempt, ns); err != nil {
-							// SQL and Kubernetes errors can embed credentials; do not log raw errors.
-							log.Printf("namespace %s reconciliation failed; retrying", ns.Name)
-						}
-						done()
-						if ctx.Err() != nil {
-							break
-						}
-					}
-				}
-			} else {
-				log.Print("invalid admin connection configuration; retrying")
-			}
-		} else {
-			log.Print("cannot read admin connection file; retrying")
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
+	mgr, err := ctrl.NewManager(config, ctrl.Options{
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	if err != nil {
+		logger.Error(err, "cannot create controller manager")
+		os.Exit(1)
+	}
+	controller := &operator.Controller{
+		Client: client, DB: &operator.SQLDatabase{Config: admin},
+		Namespace: namespace, Template: template, Excluded: excluded,
+	}
+	if err := controller.SetupWithManager(mgr); err != nil {
+		logger.Error(err, "cannot register namespace controller")
+		os.Exit(1)
+	}
+	if err := mgr.Start(ctx); err != nil {
+		logger.Error(err, "controller manager failed")
+		os.Exit(1)
 	}
 }

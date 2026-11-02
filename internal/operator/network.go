@@ -99,7 +99,7 @@ func (c *Controller) applyPolicy(ctx context.Context, desired *networking.Networ
 		return err
 	}
 	if !managed(existing, tenant) {
-		return fmt.Errorf("NetworkPolicy %s is not managed by roachmotel", desired.Name)
+		return errors.New("NetworkPolicy is not managed by roachmotel")
 	}
 	if reflect.DeepEqual(existing.Spec, desired.Spec) {
 		return nil
@@ -119,11 +119,17 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 			return errors.New("invalid retained credential record")
 		}
 		sqlErr = c.DB.Revoke(ctx, id)
+		if sqlErr != nil {
+			sqlErr = fmt.Errorf("revoke SQL access: %w", sqlErr)
+		}
 	} else if !apierrors.IsNotFound(err) {
-		sqlErr = err
+		sqlErr = fmt.Errorf("read retained credential: %w", err)
 	}
 	// Attempt all cleanup even when SQL or an API operation temporarily fails.
 	networkErr := c.ensureNetwork(ctx, ns.Name, false)
+	if networkErr != nil {
+		networkErr = fmt.Errorf("ensure infrastructure policy: %w", networkErr)
+	}
 	namespace, _, _ := NetworkService(c.Template)
 	policies := c.Client.NetworkingV1().NetworkPolicies(namespace)
 	policy, policyErr := policies.Get(ctx, masterName, meta.GetOptions{})
@@ -137,6 +143,8 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 	}
 	if apierrors.IsNotFound(policyErr) {
 		policyErr = nil
+	} else if policyErr != nil {
+		policyErr = fmt.Errorf("remove tenant policy: %w", policyErr)
 	}
 	secrets := c.Client.CoreV1().Secrets(ns.Name)
 	secret, secretErr := secrets.Get(ctx, SecretName, meta.GetOptions{})
@@ -150,6 +158,8 @@ func (c *Controller) revoke(ctx context.Context, ns *core.Namespace) error {
 	}
 	if apierrors.IsNotFound(secretErr) {
 		secretErr = nil
+	} else if secretErr != nil {
+		secretErr = fmt.Errorf("remove application credential: %w", secretErr)
 	}
 	return errors.Join(sqlErr, networkErr, policyErr, secretErr)
 }
