@@ -5,7 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/deploy.sh [options]
 
-Test, build and push an image, apply the Zebu manifests, then wait for rollout.
+Test, build and push the operator image, deploy it, then wait for rollout.
+Fluent Bit is deployed separately with kubectl apply -k deploy/fluent-bit.
 Requires Go, Docker with buildx, Python 3, kubectl, registry login, and an existing
 roachmotel-system/roachmotel-admin Secret in the target cluster.
 

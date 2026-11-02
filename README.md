@@ -30,7 +30,8 @@ kubectl apply -f deploy/operator.yaml
 
 For the Zebu cluster, the configuration in `deploy/kustomization.yaml` uses
 `cockroachdb-secure-public.cockroach.svc.cluster.local:26257` with TLS
-and a pinned controller image, plus the Fluent Bit collector.
+and a pinned controller image. It deploys only the operator; Fluent Bit is optional
+and deployed separately.
 
 Supply `roachmotel-system/roachmotel-admin` as above, then run:
 
@@ -64,7 +65,16 @@ provide namespace isolation.
 
 ## Cluster container logs
 
-`deploy/` includes a Fluent Bit DaemonSet in the `logs` namespace. Its native
+`deploy/fluent-bit/` is a separate deployment for the optional Fluent Bit DaemonSet
+in the `logs` namespace. Neither `scripts/deploy.sh` nor `kubectl apply -k deploy`
+includes it. Deploy it explicitly when ready:
+
+```sh
+kubectl --context zebu apply -k deploy/fluent-bit
+kubectl --context zebu -n logs rollout status daemonset/fluent-bit
+```
+
+Its native
 [`pgsql` output](https://docs.fluentbit.io/manual/data-pipeline/outputs/postgresql)
 sends logs directly to CockroachDB with `CockroachDB On`, using the generated
 `roachkey` Secret's `DATABASE_URL`. No additional service or custom image is needed.
